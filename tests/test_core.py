@@ -10,9 +10,9 @@ import yaml
 
 from video_tool.config import DEFAULT_FILE, _walk, default_config_path, input_urls, load_config, parser_for, validate
 from video_tool.models import Comment, CommentResult, Discovery, SegmentResult, Video
-from video_tool.downloader import DownloadResult
-from video_tool.pipeline import collect_or_run
-from video_tool.platforms.douyin import DouyinAdapter, _comment_objects, likes_count
+from video_tool.downloader import DownloadResult, download_images
+from video_tool.pipeline import collect_or_run, download_one
+from video_tool.platforms.douyin import DouyinAdapter, _comment_objects, likes_count, video_id
 from video_tool.reporter import generate
 from video_tool.storage import Store
 from video_tool.transcriber import Transcriber, merge_text
@@ -22,9 +22,9 @@ class CoreTests(unittest.TestCase):
     def test_local_config_takes_precedence_without_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            self.assertEqual(default_config_path(root), root / "config.yaml.bak")
+            (root / "config.yaml").write_text("platform: douyin\n", encoding="utf-8")
             self.assertEqual(default_config_path(root), root / "config.yaml")
-            (root / "config.local.yaml").write_text("platform: douyin\n", encoding="utf-8")
-            self.assertEqual(default_config_path(root), root / "config.local.yaml")
 
     def test_cli_overrides_each_config_leaf(self):
         defaults = yaml.safe_load(DEFAULT_FILE.read_text(encoding="utf-8"))
@@ -42,9 +42,9 @@ class CoreTests(unittest.TestCase):
                                   "--report-top-comments", "20", "--urls-file", "inputs.txt"])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "config.yaml").write_text(DEFAULT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+            (root / "config.yaml.bak").write_text(DEFAULT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
             (root / "inputs.txt").write_text("https://www.douyin.com/video/2\nhttps://www.douyin.com/video/1\n", encoding="utf-8")
-            config = load_config(root / "config.yaml", args)
+            config = load_config(root / "config.yaml.bak", args)
             self.assertEqual(config["report"]["top_comments"], 20)
             self.assertEqual(config["inputs"]["urls_file"], root / "inputs.txt")
             self.assertEqual(len(input_urls(config)), 2)
@@ -192,6 +192,111 @@ class CoreTests(unittest.TestCase):
         ]
         self.assertEqual(adapter._visible_video_urls(profile=True), ["https://www.douyin.com/video/111"])
 
+    def test_note_metadata_uses_album_images_in_order(self):
+        item = {"aweme_id": "123", "aweme_type": 68, "desc": "图文标题", "author": {"uid": "a", "nickname": "作者"},
+                "images": [{"url_list": ["https://cdn.example/1a", "https://cdn.example/1b"]},
+                           {"url": {"url_list": ["https://cdn.example/2"]}}],
+                "video": {"play_addr": {"url_list": ["https://cdn.example/music"]}}}
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter._navigate = lambda _: "https://www.douyin.com/note/123"
+        adapter.responses = [("https://www.douyin.com/aweme/detail", {"aweme_detail": item})]
+        adapter._hydration = lambda: []
+        adapter.page = Mock()
+        post = adapter.read_video("https://www.douyin.com/note/123")
+        self.assertEqual(video_id(post.url), "123")
+        self.assertEqual(post.content_type, "image")
+        self.assertEqual(post.image_urls, [["https://cdn.example/1a", "https://cdn.example/1b"],
+                                           ["https://cdn.example/2"]])
+        self.assertEqual(post.media_urls, [])
+        self.assertEqual(post.metadata_status, "complete")
+
+    def test_note_uses_rendered_album_when_aweme_images_are_missing(self):
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter._navigate = lambda _: "https://www.douyin.com/note/123"
+        adapter.responses = [("https://www.douyin.com/aweme/detail",
+                              {"aweme_detail": {"aweme_id": "123", "aweme_type": 68,
+                                                "desc": "", "author": {"uid": "a"}}})]
+        adapter._hydration = lambda: []
+        adapter.page = Mock()
+        adapter.page.title.return_value = "图文标题 - 抖音"
+        adapter.page.locator.return_value.first.inner_text.side_effect = RuntimeError("no heading")
+        adapter.page.locator.return_value.first.get_attribute.side_effect = RuntimeError("no meta")
+        adapter.page.locator.return_value.evaluate_all.return_value = [
+            ["https://cdn.example/1", "https://cdn.example/1"], ["https://cdn.example/2"]]
+        post = adapter.read_video("https://www.douyin.com/note/123")
+        self.assertEqual(post.title, "图文标题")
+        self.assertEqual(post.image_urls, [["https://cdn.example/1"], ["https://cdn.example/2"]])
+        self.assertEqual(post.metadata_status, "complete")
+
+    def test_profile_note_is_not_duplicated_by_video_link(self):
+        class Locator:
+            def evaluate_all(self, _):
+                return ["https://www.douyin.com/video/123"]
+
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter.page = Mock()
+        adapter.page.locator.return_value = Locator()
+        adapter.responses = [("https://www.douyin.com/aweme/v1/web/aweme/post/",
+                              {"aweme_list": [{"aweme_id": "123", "aweme_type": 68,
+                                               "images": [{"url_list": ["https://cdn.example/1"]}]}]})]
+        self.assertEqual(adapter._visible_video_urls(profile=True), ["https://www.douyin.com/note/123"])
+
+    def test_download_images_retries_bad_source_and_saves_real_extensions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "123"
+            def fake_download(urls, destination, _):
+                data = {"https://cdn.example/bad": b"<html>blocked</html>",
+                        "https://cdn.example/jpeg": b"\xff\xd8\xffphoto",
+                        "https://cdn.example/png": b"\x89PNG\r\n\x1a\nphoto"}[urls[0]]
+                destination.write_bytes(data)
+                return DownloadResult(destination, "application/octet-stream")
+            with patch("video_tool.downloader.download", side_effect=fake_download):
+                result = download_images([["https://cdn.example/bad", "https://cdn.example/jpeg"],
+                                          ["https://cdn.example/png"]], folder, 5)
+            self.assertEqual(result, folder)
+            self.assertEqual([path.name for path in sorted(folder.iterdir())], ["01.jpg", "02.png"])
+            self.assertEqual((folder / "01.jpg").read_bytes(), b"\xff\xd8\xffphoto")
+
+    def test_download_command_selects_note_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(DEFAULT_FILE)
+            config["download"]["output_dir"] = Path(directory)
+            post = Video("douyin", "123", "https://www.douyin.com/note/123", content_type="image",
+                         image_urls=[["https://cdn.example/1"]])
+            adapter = Mock()
+            adapter.read_video.return_value = post
+            with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter), \
+                 patch("video_tool.pipeline.download_images", return_value=Path(directory) / "123") as images, \
+                 patch("video_tool.pipeline.download") as video_download:
+                result = download_one(config, post.url)
+            self.assertEqual(result, Path(directory) / "123")
+            images.assert_called_once()
+            video_download.assert_not_called()
+
+    def test_run_downloads_note_without_transcriber(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = load_config(DEFAULT_FILE)
+            config["runtime"]["state_db"] = root / "state.sqlite3"
+            config["report"]["output_dir"] = root / "reports"
+            config["download"]["output_dir"] = root / "downloads"
+            config["asr"]["api_key"] = ""
+            post = Video("douyin", "123", "https://www.douyin.com/note/123", "图文标题",
+                         "author", "作者", content_type="image", image_urls=[["https://cdn.example/1"]],
+                         metadata_status="complete")
+            adapter = Mock()
+            adapter.read_video.return_value = post
+            adapter.read_comments.return_value = CommentResult([], True, "到底")
+            with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter), \
+                 patch("video_tool.pipeline.download_images", return_value=root / "downloads" / "123") as images, \
+                 patch("video_tool.pipeline.Transcriber") as asr:
+                status = {}
+                reports = collect_or_run(config, [post.url], True, status)
+            self.assertEqual(status["failed"], 0)
+            images.assert_called_once()
+            asr.assert_not_called()
+            self.assertIn("图片状态：images\\_saved", reports[0].read_text(encoding="utf-8"))
+
     def test_run_pipeline_writes_report_and_resumes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -199,6 +304,7 @@ class CoreTests(unittest.TestCase):
             config["runtime"]["state_db"] = root / "state.sqlite3"
             config["report"]["output_dir"] = root / "reports"
             config["download"]["output_dir"] = root / "downloads"
+            config["asr"]["api_key"] = "test"
             media = root / "downloads" / "123.mp4"
             media.parent.mkdir()
             media.write_bytes(b"media")
@@ -224,6 +330,7 @@ class CoreTests(unittest.TestCase):
             config = load_config(DEFAULT_FILE)
             config["runtime"]["state_db"] = root / "state.sqlite3"
             config["report"]["output_dir"] = root / "reports"
+            config["asr"]["api_key"] = "test"
             video = Video("douyin", "123", "https://www.douyin.com/video/123", "标题",
                           "author", "作者", tags_status="absent", media_urls=["https://media.example/v.mp4"],
                           metadata_status="complete")

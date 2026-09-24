@@ -30,6 +30,8 @@ class Video:
     transcript_status: str = "pending"
     transcript: str = ""
     transcript_error: str = ""
+    content_type: str = "video"  # video or image
+    image_urls: list[list[str]] = field(default_factory=list)
 
 
 @dataclass

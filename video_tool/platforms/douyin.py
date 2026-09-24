@@ -13,7 +13,7 @@ from playwright.sync_api import sync_playwright
 from ..models import Comment, CommentResult, Discovery, Video
 
 LOG = logging.getLogger(__name__)
-VIDEO_RE = re.compile(r"/video/(\d+)")
+VIDEO_RE = re.compile(r"/(?:video|note)/(\d+)")
 HASHTAG_RE = re.compile(r"(?<!\w)#([^\s#]+)")
 
 
@@ -60,7 +60,7 @@ def _walk_objects(value):
 def _aweme_objects(payload):
     seen = set()
     for obj in _walk_objects(payload):
-        if "aweme_id" in obj and ("video" in obj or "desc" in obj):
+        if "aweme_id" in obj and ("video" in obj or "images" in obj or "desc" in obj):
             key = str(obj["aweme_id"])
             if key not in seen:
                 seen.add(key)
@@ -74,6 +74,27 @@ def _comment_objects(payload):
             if obj.get("reply_id") not in (None, "", "0", 0) or obj.get("reply_to_reply_id") not in (None, "", "0", 0):
                 continue
             yield obj
+
+
+def _image_sources(item: dict) -> list[list[str]]:
+    """Keep each photo's alternative URLs together and in album order."""
+    images = item.get("images") or []
+    result = []
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        urls = image.get("url_list") or _nested(image, "url", "url_list") or []
+        if isinstance(urls, str):
+            urls = [urls]
+        sources = list(dict.fromkeys(url for url in urls if isinstance(url, str) and url.startswith("https://")))
+        if sources:
+            result.append(sources)
+    return result
+
+
+def _content_url(item: dict) -> str:
+    kind = "note" if str(item.get("aweme_type")) == "68" or item.get("images") else "video"
+    return f"https://www.douyin.com/{kind}/{item['aweme_id']}"
 
 
 class DouyinAdapter:
@@ -125,7 +146,8 @@ class DouyinAdapter:
                     deadline = time.monotonic() + min(8, self.browser_config["navigation_timeout_seconds"])
                     while time.monotonic() < deadline:
                         if any(str(item.get("aweme_id")) == identifier
-                               for _, payload in self.responses for item in _aweme_objects(payload)):
+                               for payload in [data for _, data in self.responses] + self._hydration()
+                               for item in _aweme_objects(payload)):
                             break
                         try:
                             ready = self.page.locator("video").evaluate_all(
@@ -189,25 +211,48 @@ class DouyinAdapter:
                 continue
         return data
 
+    def _visible_image_sources(self) -> list[list[str]]:
+        """Read the rendered album when the page does not expose aweme images."""
+        slides = self.page.locator(".dySwiperSlide").evaluate_all(
+            "els => els.map(slide => [...slide.querySelectorAll('img')].flatMap(img => [img.currentSrc, img.src]))")
+        if not slides or any(not sources for sources in slides):
+            return []
+        images = []
+        for sources in slides:
+            urls = list(dict.fromkeys(url for url in sources if isinstance(url, str) and url.startswith("https://")))
+            if not urls:
+                return []
+            images.append(urls)
+        return images
+
     def _visible_video_urls(self, profile: bool = False):
         urls = []
         selector = ('[data-e2e="user-post-list"] a[href*="/video/"], '
+                    '[data-e2e="user-post-list"] a[href*="/note/"], '
                     '[data-e2e="user-post-item"] a[href*="/video/"], '
-                    '[data-e2e="user-video-list"] a[href*="/video/"]') if profile else 'a[href*="/video/"]'
+                    '[data-e2e="user-post-item"] a[href*="/note/"], '
+                    '[data-e2e="user-video-list"] a[href*="/video/"], '
+                    '[data-e2e="user-video-list"] a[href*="/note/"]') if profile else 'a[href*="/video/"], a[href*="/note/"]'
         for href in self.page.locator(selector).evaluate_all("els => els.map(e => e.href)"):
             identifier = video_id(href)
             if identifier:
-                urls.append(f"https://www.douyin.com/video/{identifier}")
+                kind = "note" if "/note/" in urlparse(href).path else "video"
+                urls.append(f"https://www.douyin.com/{kind}/{identifier}")
         for response_url, payload in self.responses:
             if profile and not ("/aweme/post" in response_url or "/post/" in response_url):
                 continue
             for item in _aweme_objects(payload):
-                urls.append(f"https://www.douyin.com/video/{item['aweme_id']}")
+                urls.append(_content_url(item))
         if not profile:
             for payload in self._hydration():
                 for item in _aweme_objects(payload):
-                    urls.append(f"https://www.douyin.com/video/{item['aweme_id']}")
-        return list(dict.fromkeys(urls))
+                    urls.append(_content_url(item))
+        unique = {}
+        for url in urls:
+            identifier = video_id(url)
+            if identifier and (identifier not in unique or "/note/" in urlparse(url).path):
+                unique[identifier] = url
+        return list(unique.values())
 
     def discover(self, profile_url: str, limit: int | None, previous: Discovery | None = None,
                  on_progress: Callable[[Discovery], None] | None = None) -> Discovery:
@@ -271,10 +316,17 @@ class DouyinAdapter:
             candidates.extend(_aweme_objects(payload))
         for payload in self._hydration():
             candidates.extend(_aweme_objects(payload))
-        match = next((item for item in candidates if str(item.get("aweme_id")) == identifier), None)
+        matches = [item for item in candidates if str(item.get("aweme_id")) == identifier]
+        match = max(matches, key=lambda item: (len(_image_sources(item)),
+                                                bool(_nested(item, "video", "play_addr", "url_list")),
+                                                bool(item.get("desc"))), default=None)
         if not identifier:
             raise ValueError(f"无法从页面解析视频 ID: {url}")
-        video = Video("douyin", identifier, f"https://www.douyin.com/video/{identifier}")
+        kind = "note" if "/note/" in urlparse(final).path else "video"
+        if match and (str(match.get("aweme_type")) == "68" or match.get("images")):
+            kind = "note"
+        video = Video("douyin", identifier, f"https://www.douyin.com/{kind}/{identifier}")
+        video.content_type = "image" if kind == "note" else "video"
         if match:
             video.title = str(match.get("desc") or "").strip()
             author = match.get("author") or {}
@@ -282,9 +334,12 @@ class DouyinAdapter:
             video.author_name = str(author.get("nickname") or "")
             video.hashtags = list(dict.fromkeys(HASHTAG_RE.findall(video.title)))
             video.tags_status = "present" if video.hashtags else "absent"
-            media = match.get("video") or {}
-            for field in ("play_addr", "play_addr_h264", "play_addr_265"):
-                video.media_urls.extend(_nested(media, field, "url_list") or [])
+            if video.content_type == "image":
+                video.image_urls = _image_sources(match)
+            else:
+                media = match.get("video") or {}
+                for field in ("play_addr", "play_addr_h264", "play_addr_265"):
+                    video.media_urls.extend(_nested(media, field, "url_list") or [])
         if not video.title:
             for selector in ("h1", "[data-e2e='video-desc']", "meta[property='og:description']"):
                 try:
@@ -295,6 +350,13 @@ class DouyinAdapter:
                         break
                 except Exception:
                     pass
+        if not video.title:
+            try:
+                title = self.page.title().strip()
+                if title.endswith(" - 抖音"):
+                    video.title = title[:-5].strip()
+            except Exception:
+                pass
         if not match:
             if video.title:
                 video.hashtags = list(dict.fromkeys(HASHTAG_RE.findall(video.title)))
@@ -317,15 +379,21 @@ class DouyinAdapter:
                         break
             except Exception:
                 pass
-        if not video.media_urls:
+        if video.content_type == "video" and not video.media_urls:
             try:
                 sources = self.page.locator("video").evaluate_all(
                     "els => els.flatMap(e => [e.currentSrc, e.src]).filter(Boolean)")
                 video.media_urls.extend(source for source in sources if identifier in source)
             except Exception:
                 pass
+        if video.content_type == "image" and not video.image_urls:
+            try:
+                video.image_urls = self._visible_image_sources()
+            except Exception:
+                pass
         video.media_urls = list(dict.fromkeys(url for url in video.media_urls if isinstance(url, str) and url.startswith("https://")))
-        video.metadata_status = "complete" if video.title and video.media_urls else "partial"
+        has_media = video.image_urls if video.content_type == "image" else video.media_urls
+        video.metadata_status = "complete" if video.title and has_media else "partial"
         video.metadata_error = "" if video.metadata_status == "complete" else "标题或媒体来源未能从可访问页面读取"
         return video
 

@@ -48,7 +48,7 @@ class Transcriber:
         if not ffmpeg:
             raise FileNotFoundError(
                 f"找不到 FFmpeg：{configured}。请安装包含 ffprobe 的 FFmpeg，并将其 bin 目录加入 PyCharm 运行环境的 PATH；"
-                "或将 config.yaml 的 audio.ffmpeg_path 设置为 ffmpeg.exe 的完整路径。"
+                "或将 config.yaml.bak 的 audio.ffmpeg_path 设置为 ffmpeg.exe 的完整路径。"
             )
         executable = Path(ffmpeg)
         sibling = executable.with_name("ffprobe.exe" if executable.suffix.lower() == ".exe" else "ffprobe")

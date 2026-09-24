@@ -14,8 +14,8 @@ DEFAULT_FILE = Path(__file__).resolve().parent.parent / "config.example.yaml"
 
 def default_config_path(project_dir: Path) -> Path:
     """Use the untracked local config when present, otherwise the safe template."""
-    local = project_dir / "config.local.yaml"
-    return local if local.is_file() else project_dir / "config.yaml"
+    local = project_dir / "config.yaml"
+    return local if local.is_file() else project_dir / "config.yaml.bak"
 
 
 PATH_KEYS = {
@@ -177,10 +177,10 @@ def validate(config: dict, command: str, urls: list[str]):
     if config["asr"]["overlap_seconds"] >= config["asr"]["chunk_seconds"]:
         raise ValueError("asr.overlap_seconds 必须小于 asr.chunk_seconds")
     if command in {"run", "collect", "download"} and not urls:
-        raise ValueError("没有输入 URL；请在 config.yaml 的 inputs.urls 或 --url 中提供")
+        raise ValueError("没有输入 URL；请在 config.yaml.bak 的 inputs.urls 或 --url 中提供")
     if command == "download" and len(urls) != 1:
-        raise ValueError("download 命令只接受一条视频 URL")
-    if command in {"run", "transcribe"} and not config["asr"]["api_key"]:
+        raise ValueError("download 命令只接受一条作品 URL")
+    if command == "transcribe" and not config["asr"]["api_key"]:
         raise ValueError("MiMo API Key 为空；请设置 asr.api_key 或 --mimo-api-key")
     for index, url in enumerate(urls, 1):
         parsed = urlparse(url)

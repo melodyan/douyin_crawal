@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .downloader import download
+from .downloader import download, download_images
 from .models import CommentResult, Video
 from .platforms.douyin import DouyinAdapter, is_profile, video_id
 from .reporter import generate
@@ -28,7 +28,8 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
     identifier = video_id(url)
     old = store.get_video("douyin", identifier) if identifier else None
     if old and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]:
-        if old.metadata_status == "complete" and old.comments_complete and (not full or old.transcript_status == "complete"):
+        media_done = old.transcript_status == ("images_saved" if old.content_type == "image" else "complete")
+        if old.metadata_status == "complete" and old.comments_complete and (not full or media_done):
             LOG.info("跳过已完成视频 %s", old.video_id)
             return True
     try:
@@ -54,8 +55,25 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         store.save_comments("douyin", video.video_id, result, replace=config["crawl"]["refresh_completed"])
         video.comments_complete = result.complete
         video.comments_stop_reason = result.stop_reason
-    if not full or (old and old.transcript_status == "complete" and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]):
+    media_done = old and old.transcript_status == ("images_saved" if video.content_type == "image" else "complete")
+    if not full or (media_done and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]):
         return video.metadata_status == "complete" and not comments_failed
+    if video.content_type == "image":
+        try:
+            folder = Path(config["download"]["output_dir"]) / video.video_id
+            download_images(video.image_urls, folder, config["audio"]["download_timeout_seconds"])
+            video.transcript_status, video.transcript_error = "images_saved", ""
+            LOG.info("图文 %s 已保存图片：%s", video.video_id, folder)
+        except (OSError, RuntimeError) as exc:
+            video.transcript_status, video.transcript_error = "failed", str(exc)
+            LOG.error("图文 %s 图片下载失败：%s", video.video_id, exc)
+        store.save_video(video)
+        return video.metadata_status == "complete" and video.transcript_status == "images_saved" and not comments_failed
+    if not config["asr"]["api_key"]:
+        video.transcript_status, video.transcript_error = "failed", "MiMo API Key 为空；请设置 asr.api_key 或 --mimo-api-key"
+        store.save_video(video)
+        LOG.error("视频 %s 转写前检查失败：%s", video.video_id, video.transcript_error)
+        return False
     transcriber = Transcriber(config["audio"], config["asr"])
     try:
         transcriber.check_dependencies()
@@ -153,6 +171,9 @@ def download_one(config: dict, url: str) -> Path:
     adapter = DouyinAdapter(config["browser"], config["crawl"])
     try:
         video = adapter.read_video(url)
+        if video.content_type == "image":
+            folder = Path(config["download"]["output_dir"]) / video.video_id
+            return download_images(video.image_urls, folder, config["audio"]["download_timeout_seconds"])
         destination = Path(config["download"]["output_dir"]) / f"{video.video_id}.mp4"
         result = download(video.media_urls, destination, config["audio"]["download_timeout_seconds"])
         if not result.path:
