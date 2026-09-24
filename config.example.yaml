@@ -1,0 +1,141 @@
+# 抖音视频采集与转写工具配置（草案）
+# 参考配置，不包含个人链接或密钥。复制 config.yaml 为 config.local.yaml 后填写本地值。
+# 无参数运行优先读取 config.local.yaml；若不存在才读取 config.yaml。
+# 命令行参数可临时覆盖对应配置，例如：python main.py --report-output-dir "D:\\reports"
+# 所有相对路径都以本文件所在目录为起点。
+# null = 不设置该选项或限制；true = 开启；false = 关闭。
+# 当前只实现抖音。小红书、B站的值先预留，选择后会提示暂未支持。
+
+# 一次运行只处理一个平台的链接，不能混用不同平台的 URL。
+platform: "douyin"  # --platform douyin|xiaohongshu|bilibili
+
+inputs:
+  # 直接写在本文件中的视频或博主主页链接。每个链接单独占一行。
+  # [] 表示这里没有链接；示例：
+  # urls:
+  #   - "https://www.douyin.com/video/实际视频ID"
+  #   - "https://www.douyin.com/user/实际用户标识"
+  urls: []  # --url URL，可重复传入多个；命令行传入时替换此列表
+
+  # 装有链接的纯文本文件路径，不是抖音网址。文件中每行写一个完整链接。
+  # null 表示不读取文件。urls 和 urls_file 同时填写时，合并并去重。
+  # 示例：urls_file: "work/urls.txt"
+  urls_file: null  # --urls-file PATH；--no-urls-file 可清除此项
+
+  # 输入博主主页时，最多处理多少条视频；null 表示尽量遍历全部公开视频。
+  # 对单独输入的视频链接不起作用。填 100 就只处理该主页前 100 条。
+  max_videos_per_profile: null  # --inputs-max-videos-per-profile N；--inputs-no-video-limit 清除上限
+
+browser:
+  # false 打开可见浏览器，方便手动登录和处理验证；true 在后台运行。
+  # 如果开启后台模式而页面要求人工操作，该任务会暂停或失败。
+  headless: false  # --browser-headless / --no-browser-headless
+
+  # 保存浏览器会话的目录；下次运行可复用登录状态。
+  # 目录可能含有登录信息，只应保存在你控制的电脑上。
+  profile_dir: "work/browser"  # --browser-profile-dir PATH
+
+  # 打开单个页面最多等待多少秒；超时后按 crawl.max_retries 重试。
+  navigation_timeout_seconds: 30  # --browser-navigation-timeout-seconds N
+
+  # 检测到需要手动登录或验证时，最多等你操作多少秒。
+  # 0 表示一直等待，直到你完成操作或手动终止程序。
+  manual_wait_seconds: 0  # --browser-manual-wait-seconds N
+
+crawl:
+  # 两次页面采集操作之间至少等待多少秒，用于控制采集速度。
+  delay_seconds: 2  # --crawl-delay-seconds N
+
+  # 页面加载、翻页或采集临时失败时，最多重试多少次。
+  max_retries: 3  # --crawl-max-retries N
+
+  # 第一次重试前的等待秒数；后续重试逐步延长等待。
+  retry_backoff_seconds: 5  # --crawl-retry-backoff-seconds N
+
+  # 每条视频最多采集多少条一级评论；null 表示尽量读完。
+  # 如填 500，报告里的点赞前 50 仅基于这 500 条已采集评论。
+  max_comments_per_video: null  # --crawl-max-comments-per-video N；--crawl-no-comment-limit 清除上限
+
+  # 连续滚动多少次都没有新视频或评论后，停止当前翻页。
+  # 只有页面明确显示到底，才将采集状态标记为“完整”。
+  no_new_content_scrolls: 3  # --crawl-no-new-content-scrolls N
+
+  # true 读取进度数据库，跳过已经完成的视频；false 本次不跳过。
+  resume: true  # --crawl-resume / --no-crawl-resume
+
+  # true 重新采集并转写已完成视频，可能增加 MiMo 用量；false 复用结果。
+  refresh_completed: false  # --crawl-refresh-completed / --no-crawl-refresh-completed
+
+audio:
+  # FFmpeg 程序位置。已安装并加入 PATH 时保持 ffmpeg 即可；
+  # 否则填写 ffmpeg.exe 的完整路径。
+  ffmpeg_path: "ffmpeg"  # --audio-ffmpeg-path PATH
+
+  # 临时 MP3 音频的码率，单位 kbps。较低码率可减少上传量。
+  mp3_bitrate_kbps: 64  # --audio-mp3-bitrate-kbps N
+
+  # 获取单条视频媒体内容最多等待多少秒。
+  download_timeout_seconds: 120  # --audio-download-timeout-seconds N
+
+  # false 转写后删除临时媒体；true 保留在工作目录供复核。
+  # 100–1000 条视频若全部保留，会占用大量磁盘空间。
+  keep_temporary_files: false  # --audio-keep-temporary-files / --no-audio-keep-temporary-files
+
+download:
+  # 单独运行下载模块时，视频文件保存到这里；目录不存在时自动创建。
+  # 完整流程仍按 audio.keep_temporary_files 决定是否保留临时媒体。
+  output_dir: "outputs/downloads"  # --download-output-dir PATH
+
+asr:
+  # 小米 MiMo API Key。请在运行前填写；留空时程序会明确报错。
+  # 不要把填有真实密钥的 config.yaml 提交到版本控制。
+  api_key: ""  # --mimo-api-key KEY
+
+  # 小米 MiMo API 地址。正常使用无需修改。
+  base_url: "https://api.xiaomimimo.com/v1"  # --asr-base-url URL
+
+  # 小米的语音识别模型；当前默认 mimo-v2.5-asr。
+  model: "mimo-v2.5-asr"  # --asr-model NAME
+
+  # auto 自动识别中英文；zh 指定中文；en 指定英文。
+  language: "auto"  # --asr-language auto|zh|en
+
+  # 长视频按多少秒切段后逐段转写；程序还会检查每段编码后的大小。
+  chunk_seconds: 180  # --asr-chunk-seconds N
+
+  # 相邻音频片段重复保留的秒数，减少切段处漏字；合并文字时去重。
+  overlap_seconds: 2  # --asr-overlap-seconds N
+
+  # 单次 MiMo 请求最多等待多少秒。
+  timeout_seconds: 120  # --asr-timeout-seconds N
+
+  # MiMo 请求临时失败时最多重试多少次。
+  max_retries: 3  # --asr-max-retries N
+
+  # 单独运行转写模块时，文字文件保存到这里；完整流程的文字仍写入报告。
+  output_dir: "outputs/transcripts"  # --asr-output-dir PATH
+
+report:
+  # Markdown 报告目录；不存在时自动创建。每位博主生成一份报告。
+  output_dir: "outputs/reports"  # --report-output-dir PATH
+
+  # 每条视频写入点赞数最高的多少条已采集一级评论。
+  top_comments: 50  # --report-top-comments N
+
+  # 是否写出评论者昵称；关闭时仍写评论正文和点赞数。
+  include_comment_author: false  # --report-include-comment-author / --no-report-include-comment-author
+
+  # true：部分步骤失败时仍生成报告并标注缺失。
+  # false：标题、链接或转写失败的视频不进入报告正文，但列入失败摘要。
+  # 评论未采集完整时，无论此项为何值，都需在报告中标明覆盖范围。
+  write_partial_results: true  # --report-write-partial-results / --no-report-write-partial-results
+
+runtime:
+  # 保存采集状态、评论和转写结果，用于中断后续跑。
+  state_db: "work/state.sqlite3"  # --runtime-state-db PATH
+
+  # 运行日志文件，记录每条视频的处理进度和失败原因。
+  log_file: "work/run.log"  # --runtime-log-file PATH
+
+  # DEBUG 最详细；INFO 适合日常使用；WARNING/ERROR 只显示问题。
+  log_level: "INFO"  # --runtime-log-level DEBUG|INFO|WARNING|ERROR
