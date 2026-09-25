@@ -52,8 +52,7 @@ crawl:
   # 第一次重试前的等待秒数；后续重试逐步延长等待。
   retry_backoff_seconds: 5  # --crawl-retry-backoff-seconds N
 
-  # 每条视频最多采集多少条一级评论；null 表示尽量读完。
-  # 如填 500，报告里的点赞前 50 仅基于这 500 条已采集评论。
+  # 每条视频最多采集多少条一级评论；null 表示尽量读完一级评论及其回复。
   max_comments_per_video: null  # --crawl-max-comments-per-video N；--crawl-no-comment-limit 清除上限
 
   # 连续滚动多少次都没有新视频或评论后，停止当前翻页。
@@ -116,11 +115,11 @@ asr:
   output_dir: "outputs/transcripts"  # --asr-output-dir PATH
 
 report:
-  # Markdown 报告目录；不存在时自动创建。每位博主生成一份报告。
+  # Markdown 报告目录；不存在时自动创建。每个作品生成一份报告。
   output_dir: "outputs/reports"  # --report-output-dir PATH
 
-  # 每条视频写入点赞数最高的多少条已采集一级评论。
-  top_comments: 50  # --report-top-comments N
+  # 每份报告写入多少条点赞最高的一级评论及其回复；null 表示全部。
+  top_comments: null  # --report-top-comments N；--report-no-comment-limit 清除上限
 
   # 是否写出评论者昵称；关闭时仍写评论正文和点赞数。
   include_comment_author: false  # --report-include-comment-author / --no-report-include-comment-author

@@ -10,6 +10,8 @@ class Comment:
     text: str
     likes: int = 0
     author: str = ""
+    parent_id: str = ""
+    reply_to_id: str = ""
 
 
 @dataclass
@@ -27,6 +29,7 @@ class Video:
     metadata_error: str = ""
     comments_complete: bool = False
     comments_stop_reason: str = "未采集"
+    comments_version: int = 2
     transcript_status: str = "pending"
     transcript: str = ""
     transcript_error: str = ""

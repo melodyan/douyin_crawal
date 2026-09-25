@@ -70,10 +70,18 @@ def _aweme_objects(payload):
 def _comment_objects(payload):
     for obj in _walk_objects(payload):
         if "cid" in obj and "text" in obj:
-            # A reply carries reply_id/reply_to_reply_id; count only top-level.
-            if obj.get("reply_id") not in (None, "", "0", 0) or obj.get("reply_to_reply_id") not in (None, "", "0", 0):
-                continue
             yield obj
+
+
+def _comment_parent(item: dict, response_url: str) -> tuple[str, str]:
+    """Return the root comment and direct reply target, if this is a reply."""
+    root = str(item.get("reply_id") or "")
+    target = str(item.get("reply_to_reply_id") or "")
+    root = "" if root == "0" else root
+    target = "" if target == "0" else target
+    if "/comment/list/reply" in urlparse(response_url).path and not root:
+        root = (parse_qs(urlparse(response_url).query).get("comment_id") or [""])[0]
+    return root or target, target
 
 
 def _image_sources(item: dict) -> list[list[str]]:
@@ -90,6 +98,31 @@ def _image_sources(item: dict) -> list[list[str]]:
         if sources:
             result.append(sources)
     return result
+
+
+def _video_sources(item: dict) -> list[str]:
+    """Collect playable URLs across the media variants in one aweme record."""
+    media = item.get("video") or {}
+    if not isinstance(media, dict):
+        return []
+    variants = [media]
+    variants.extend(part for part in media.get("bit_rate") or [] if isinstance(part, dict))
+    sources = []
+    for variant in variants:
+        for name, address in variant.items():
+            if not (name.startswith("play_addr") or name == "download_addr") or not isinstance(address, dict):
+                continue
+            urls = address.get("url_list") or []
+            if isinstance(urls, str):
+                urls = [urls]
+            sources.extend(_https_media_url(url) for url in urls if isinstance(url, str))
+    return list(dict.fromkeys(url for url in sources if url))
+
+
+def _https_media_url(url: str) -> str:
+    if url.startswith("//"):
+        return "https:" + url
+    return url if url.startswith("https://") else ""
 
 
 def _content_url(item: dict) -> str:
@@ -201,6 +234,24 @@ class DouyinAdapter:
                 return
         raise RuntimeError("等待手动登录或验证超时")
 
+    def _login_overlay_visible(self) -> bool:
+        try:
+            return self.page.locator(
+                '[id^="login-full-panel"], #douyin_login_landing_flat_container').first.is_visible(timeout=500) is True
+        except Exception:
+            return False
+
+    def _scroll_comment_list(self):
+        """Scroll the detail route that actually owns Douyin's comment pagination."""
+        try:
+            container = self.page.locator('.route-scroll-container').first
+            if container.count() > 0:
+                container.evaluate('(element) => { element.scrollTop += 1200; }')
+                return
+        except Exception:
+            pass
+        self.page.mouse.wheel(0, 1400)
+
     def _hydration(self):
         data = []
         for selector in ("script#RENDER_DATA", "script#__NEXT_DATA__"):
@@ -308,7 +359,7 @@ class DouyinAdapter:
                 break
         return Discovery(urls, complete, stop, author_id, author_name)
 
-    def read_video(self, url: str) -> Video:
+    def read_video(self, url: str, _retry_media: bool = True) -> Video:
         final = self._navigate(url)
         identifier = video_id(final) or video_id(url)
         candidates = []
@@ -318,7 +369,7 @@ class DouyinAdapter:
             candidates.extend(_aweme_objects(payload))
         matches = [item for item in candidates if str(item.get("aweme_id")) == identifier]
         match = max(matches, key=lambda item: (len(_image_sources(item)),
-                                                bool(_nested(item, "video", "play_addr", "url_list")),
+                                                bool(_video_sources(item)),
                                                 bool(item.get("desc"))), default=None)
         if not identifier:
             raise ValueError(f"无法从页面解析视频 ID: {url}")
@@ -328,8 +379,9 @@ class DouyinAdapter:
         video = Video("douyin", identifier, f"https://www.douyin.com/{kind}/{identifier}")
         video.content_type = "image" if kind == "note" else "video"
         if match:
-            video.title = str(match.get("desc") or "").strip()
-            author = match.get("author") or {}
+            video.title = next((str(item["desc"]).strip() for item in matches if item.get("desc")), "")
+            author = next((item["author"] for item in matches
+                           if isinstance(item.get("author"), dict) and item["author"]), {})
             video.author_id = str(author.get("sec_uid") or author.get("uid") or "")
             video.author_name = str(author.get("nickname") or "")
             video.hashtags = list(dict.fromkeys(HASHTAG_RE.findall(video.title)))
@@ -337,9 +389,8 @@ class DouyinAdapter:
             if video.content_type == "image":
                 video.image_urls = _image_sources(match)
             else:
-                media = match.get("video") or {}
-                for field in ("play_addr", "play_addr_h264", "play_addr_265"):
-                    video.media_urls.extend(_nested(media, field, "url_list") or [])
+                for item in matches:
+                    video.media_urls.extend(_video_sources(item))
         if not video.title:
             for selector in ("h1", "[data-e2e='video-desc']", "meta[property='og:description']"):
                 try:
@@ -380,24 +431,49 @@ class DouyinAdapter:
             except Exception:
                 pass
         if video.content_type == "video" and not video.media_urls:
-            try:
-                sources = self.page.locator("video").evaluate_all(
-                    "els => els.flatMap(e => [e.currentSrc, e.src]).filter(Boolean)")
-                video.media_urls.extend(source for source in sources if identifier in source)
-            except Exception:
-                pass
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not video.media_urls:
+                try:
+                    sources = self.page.locator("video").evaluate_all("""els => {
+                        const visible = els.map(e => ({e, rect: e.getBoundingClientRect()}))
+                            .filter(x => x.rect.width > 0 && x.rect.height > 0 &&
+                                getComputedStyle(x.e).visibility !== 'hidden')
+                            .sort((a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height);
+                        if (!visible.length) return [];
+                        const player = visible[0].e;
+                        return [player.currentSrc, player.src,
+                            ...[...player.querySelectorAll('source')].map(source => source.src)].filter(Boolean);
+                    }""")
+                    video.media_urls.extend(_https_media_url(source) for source in sources
+                                            if isinstance(source, str))
+                except Exception:
+                    break
+                if not video.media_urls:
+                    self.page.wait_for_timeout(400)
         if video.content_type == "image" and not video.image_urls:
             try:
                 video.image_urls = self._visible_image_sources()
             except Exception:
                 pass
         video.media_urls = list(dict.fromkeys(url for url in video.media_urls if isinstance(url, str) and url.startswith("https://")))
+        if video.content_type == "video" and not video.media_urls and _retry_media and not self._login_overlay_visible():
+            LOG.warning("视频 %s 首次未读到媒体地址，重新加载作品页一次", identifier)
+            return self.read_video(url, _retry_media=False)
         has_media = video.image_urls if video.content_type == "image" else video.media_urls
         video.metadata_status = "complete" if video.title and has_media else "partial"
-        video.metadata_error = "" if video.metadata_status == "complete" else "标题或媒体来源未能从可访问页面读取"
+        missing = []
+        if not video.title:
+            missing.append("标题")
+        if not has_media:
+            missing.append("可下载的 HTTPS 媒体地址")
+        video.metadata_error = "" if not missing else "页面未提供" + "和".join(missing)
+        if not has_media and self._login_overlay_visible():
+            video.metadata_error = "登录弹层遮挡作品页；请在可见浏览器中登录后重试"
         return video
 
-    def read_comments(self, video: Video, limit: int | None) -> CommentResult:
+    def read_comments(self, video: Video, limit: int | None,
+                      on_progress: Callable[[CommentResult], None] | None = None,
+                      existing: list[Comment] | None = None) -> CommentResult:
         if video_id(self.page.url) != video.video_id:
             self._navigate(video.url)
         # Open the visible comment panel, if necessary. Selectors are intentionally broad;
@@ -410,45 +486,128 @@ class DouyinAdapter:
                     break
             except Exception:
                 continue
-        comments: dict[str, Comment] = {}
+        comments: dict[str, Comment] = {item.comment_id: item for item in existing or []}
+        expected_replies: dict[str, int] = {}
+        reply_more: dict[str, bool] = {}
+        seen_pages = set()
+        response_index = 0
         no_new = 0
         previous_count = -1
         parse_error = False
-        complete = False
+        top_complete = False
         stop = "连续滚动无新评论，未确认到底"
         while True:
-            for response_url, payload in self.responses:
+            new_responses = self.responses[response_index:]
+            response_index = len(self.responses)
+            batch: dict[str, Comment] = {}
+            page_seen = False
+            for response_url, payload in new_responses:
                 if "comment/list" not in response_url:
                     continue
                 response_video_id = (parse_qs(urlparse(response_url).query).get("aweme_id") or [""])[0]
-                if response_video_id != video.video_id:
+                if response_video_id and response_video_id != video.video_id:
                     continue
+                page_key = (urlparse(response_url).path,
+                            (parse_qs(urlparse(response_url).query).get("comment_id") or [""])[0],
+                            str(payload.get("cursor")),
+                            tuple(str(item.get("cid")) for item in payload.get("comments") or []
+                                  if isinstance(item, dict)))
+                if page_key not in seen_pages:
+                    seen_pages.add(page_key)
+                    page_seen = True
                 parsed = list(_comment_objects(payload))
                 if payload.get("comments") and not parsed:
                     parse_error = True
+                if "/comment/list/reply" in urlparse(response_url).path:
+                    root = (parse_qs(urlparse(response_url).query).get("comment_id") or [""])[0]
+                    if not root and parsed:
+                        root = _comment_parent(parsed[0], response_url)[0]
+                    if root and payload.get("status_code") == 0:
+                        reply_more[root] = payload.get("has_more") not in (0, False)
                 for item in parsed:
                     if str(item.get("aweme_id") or video.video_id) != video.video_id:
                         continue
                     cid = str(item.get("cid") or "")
                     if cid:
+                        parent_id, reply_to_id = _comment_parent(item, response_url)
                         comments[cid] = Comment(cid, str(item.get("text") or ""),
                                                 likes_count(item.get("digg_count")),
-                                                str(_nested(item, "user", "nickname") or ""))
-                if payload.get("status_code") == 0 and payload.get("has_more") in (0, False) and "comments" in payload and not parse_error:
-                    complete = True
-            if limit is not None and len(comments) >= limit:
-                stop = f"达到评论上限 {limit}"
+                                                str(_nested(item, "user", "nickname") or ""),
+                                                parent_id, reply_to_id)
+                        batch[cid] = comments[cid]
+                        if not parent_id:
+                            expected_replies[cid] = max(expected_replies.get(cid, 0),
+                                                        int(item.get("reply_comment_total") or 0))
+                if ("/comment/list/reply" not in urlparse(response_url).path
+                        and payload.get("status_code") == 0
+                        and payload.get("has_more") in (0, False)
+                        and "comments" in payload and not parse_error):
+                    top_complete = True
+            if on_progress and batch:
+                on_progress(CommentResult(list(batch.values()), False, "采集中"))
+            root_ids = [comment.comment_id for comment in comments.values() if not comment.parent_id]
+            selected_roots = set(root_ids[:limit]) if limit is not None else set(root_ids)
+            limit_reached = limit is not None and len(root_ids) >= limit
+            reply_counts: dict[str, int] = {}
+            for comment in comments.values():
+                if comment.parent_id:
+                    reply_counts[comment.parent_id] = reply_counts.get(comment.parent_id, 0) + 1
+            missing = sum(max(0, count - reply_counts.get(cid, 0)) for cid, count in expected_replies.items()
+                          if cid in selected_roots)
+            pending_reply_pages = sum(more for cid, more in reply_more.items() if cid in selected_roots)
+            if self._login_overlay_visible():
+                stop = "登录弹层遮挡评论，请在可见浏览器中登录后重试"
                 break
-            if complete:
-                stop = "评论响应确认到底"
+            if limit_reached and not missing and not pending_reply_pages:
+                stop = f"达到评论上限 {limit}，已采集所选一级评论的回复"
                 break
-            no_new = no_new + 1 if len(comments) == previous_count else 0
+            reply_button_found = False
+            if (missing or pending_reply_pages) and (top_complete or limit_reached):
+                try:
+                    pattern = re.compile(r"(?:展开|查看|更多).*回复|^展开更多$")
+                    reply_selector = '.replyContainer button, button.comment-reply-expand-btn'
+                    buttons = []
+                    for cid in root_ids[:limit] if limit is not None else root_ids:
+                        if (expected_replies.get(cid, 0) <= reply_counts.get(cid, 0)
+                                and not reply_more.get(cid)):
+                            continue
+                        snippet = comments[cid].text.strip().splitlines()[0][:24]
+                        if snippet:
+                            buttons.extend(self.page.locator('[data-e2e="comment-item"]')
+                                           .filter(has_text=snippet).locator(reply_selector)
+                                           .filter(has_text=pattern).all())
+                        if buttons:
+                            break
+                    for button in buttons:
+                        try:
+                            if button.is_visible():
+                                reply_button_found = True
+                                button.click(timeout=1500)
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            if top_complete and not missing and not pending_reply_pages and not parse_error:
+                stop = "一级评论与回复均确认到底"
+                break
+            no_new = no_new + 1 if len(comments) == previous_count and not page_seen else 0
             previous_count = len(comments)
             if no_new >= self.crawl["no_new_content_scrolls"]:
+                if missing or pending_reply_pages:
+                    stop = f"仍有 {missing} 条回复未采集、{pending_reply_pages} 个回复列表未到底，未确认完整"
+                    if not reply_button_found and (top_complete or limit_reached):
+                        stop += "；页面未找到可展开的回复入口"
                 break
-            self.page.mouse.wheel(0, 1400)
+            if not limit_reached and not top_complete:
+                self._scroll_comment_list()
             self.page.wait_for_timeout(max(700, int(self.crawl["delay_seconds"] * 1000)))
         if parse_error:
-            complete, stop = False, "页面返回评论，但部分评论未能解析"
+            stop = "页面返回评论，但部分评论未能解析"
         result = sorted(comments.values(), key=lambda item: (-item.likes, item.comment_id))
-        return CommentResult(result[:limit] if limit else result, complete, stop)
+        if limit is not None:
+            result = [comment for comment in result if
+                      (not comment.parent_id and comment.comment_id in selected_roots)
+                      or comment.parent_id in selected_roots]
+        return CommentResult(result, top_complete and not missing and not pending_reply_pages
+                             and not parse_error and not limit_reached, stop)

@@ -21,7 +21,8 @@ class Store:
                 author_name TEXT NOT NULL DEFAULT '', hashtags TEXT NOT NULL DEFAULT '[]',
                 tags_status TEXT NOT NULL DEFAULT 'unread', metadata_status TEXT NOT NULL DEFAULT 'pending',
                 metadata_error TEXT NOT NULL DEFAULT '', comments_complete INTEGER NOT NULL DEFAULT 0,
-                comments_stop_reason TEXT NOT NULL DEFAULT '未采集', transcript_status TEXT NOT NULL DEFAULT 'pending',
+                comments_stop_reason TEXT NOT NULL DEFAULT '未采集', comments_version INTEGER NOT NULL DEFAULT 2,
+                transcript_status TEXT NOT NULL DEFAULT 'pending',
                 transcript TEXT NOT NULL DEFAULT '', transcript_error TEXT NOT NULL DEFAULT '',
                 content_type TEXT NOT NULL DEFAULT 'video', image_urls TEXT NOT NULL DEFAULT '[]',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -30,6 +31,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS comments (
                 platform TEXT NOT NULL, video_id TEXT NOT NULL, comment_id TEXT NOT NULL,
                 text TEXT NOT NULL, likes INTEGER NOT NULL DEFAULT 0, author TEXT NOT NULL DEFAULT '',
+                parent_id TEXT NOT NULL DEFAULT '', reply_to_id TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (platform, video_id, comment_id)
             );
             CREATE TABLE IF NOT EXISTS segments (
@@ -54,6 +56,13 @@ class Store:
             self.db.execute("ALTER TABLE videos ADD COLUMN content_type TEXT NOT NULL DEFAULT 'video'")
         if "image_urls" not in video_columns:
             self.db.execute("ALTER TABLE videos ADD COLUMN image_urls TEXT NOT NULL DEFAULT '[]'")
+        if "comments_version" not in video_columns:
+            self.db.execute("ALTER TABLE videos ADD COLUMN comments_version INTEGER NOT NULL DEFAULT 1")
+        comment_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(comments)")}
+        if "parent_id" not in comment_columns:
+            self.db.execute("ALTER TABLE comments ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''")
+        if "reply_to_id" not in comment_columns:
+            self.db.execute("ALTER TABLE comments ADD COLUMN reply_to_id TEXT NOT NULL DEFAULT ''")
         self.db.commit()
 
     def close(self):
@@ -75,19 +84,20 @@ class Store:
     def save_video(self, video: Video):
         self.db.execute("""
             INSERT INTO videos (platform,video_id,url,title,author_id,author_name,hashtags,tags_status,
-              metadata_status,metadata_error,comments_complete,comments_stop_reason,transcript_status,transcript,transcript_error,
+              metadata_status,metadata_error,comments_complete,comments_stop_reason,comments_version,transcript_status,transcript,transcript_error,
               content_type,image_urls)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(platform,video_id) DO UPDATE SET
               url=excluded.url,title=excluded.title,author_id=excluded.author_id,author_name=excluded.author_name,
               hashtags=excluded.hashtags,tags_status=excluded.tags_status,metadata_status=excluded.metadata_status,
               metadata_error=excluded.metadata_error,comments_complete=excluded.comments_complete,
-              comments_stop_reason=excluded.comments_stop_reason,transcript_status=excluded.transcript_status,
+              comments_stop_reason=excluded.comments_stop_reason,comments_version=excluded.comments_version,
+              transcript_status=excluded.transcript_status,
               transcript=excluded.transcript,transcript_error=excluded.transcript_error,
               content_type=excluded.content_type,image_urls=excluded.image_urls,updated_at=CURRENT_TIMESTAMP
         """, (video.platform, video.video_id, video.url, video.title, video.author_id, video.author_name,
               json.dumps(video.hashtags, ensure_ascii=False), video.tags_status, video.metadata_status,
-              video.metadata_error, int(video.comments_complete), video.comments_stop_reason,
+              video.metadata_error, int(video.comments_complete), video.comments_stop_reason, video.comments_version,
               video.transcript_status, video.transcript, video.transcript_error,
               video.content_type, json.dumps(video.image_urls, ensure_ascii=False)))
         self.db.commit()
@@ -97,11 +107,15 @@ class Store:
             if replace:
                 self.db.execute("DELETE FROM comments WHERE platform=? AND video_id=?", (platform, video_id))
             for comment in result.comments:
-                self.db.execute("""INSERT INTO comments VALUES (?,?,?,?,?,?)
+                self.db.execute("""INSERT INTO comments
+                    (platform,video_id,comment_id,text,likes,author,parent_id,reply_to_id)
+                    VALUES (?,?,?,?,?,?,?,?)
                     ON CONFLICT(platform,video_id,comment_id) DO UPDATE SET
-                    text=excluded.text,likes=excluded.likes,author=excluded.author""",
-                    (platform, video_id, comment.comment_id, comment.text, comment.likes, comment.author))
-            self.db.execute("UPDATE videos SET comments_complete=?,comments_stop_reason=? WHERE platform=? AND video_id=?",
+                    text=excluded.text,likes=excluded.likes,author=excluded.author,
+                    parent_id=excluded.parent_id,reply_to_id=excluded.reply_to_id""",
+                    (platform, video_id, comment.comment_id, comment.text, comment.likes,
+                     comment.author, comment.parent_id, comment.reply_to_id))
+            self.db.execute("UPDATE videos SET comments_complete=?,comments_stop_reason=?,comments_version=2 WHERE platform=? AND video_id=?",
                             (int(result.complete), result.stop_reason, platform, video_id))
 
     def save_segments(self, platform: str, video_id: str, segments: list[SegmentResult]):
@@ -140,7 +154,8 @@ class Store:
     def comments(self, platform: str, video_id: str) -> list[Comment]:
         rows = self.db.execute("SELECT * FROM comments WHERE platform=? AND video_id=? ORDER BY likes DESC, comment_id",
                                (platform, video_id)).fetchall()
-        return [Comment(row["comment_id"], row["text"], row["likes"], row["author"]) for row in rows]
+        return [Comment(row["comment_id"], row["text"], row["likes"], row["author"],
+                        row["parent_id"], row["reply_to_id"]) for row in rows]
 
     def discoveries(self, platform: str, author_id: str) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM discoveries WHERE platform=? AND author_id=? ORDER BY profile_url",

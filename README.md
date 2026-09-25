@@ -1,10 +1,10 @@
 # 抖音视频和图文采集
 
-Python 3.11+。安装 `pip install -r requirements.txt`，然后运行 `playwright install chromium`，并安装 FFmpeg（使 `ffmpeg` 和 `ffprobe` 可用）。仓库中的 `config.yaml` 是不含密钥和个人链接的配置模板。复制为 `config.local.yaml`，在本地文件中填写链接和 MiMo API Key，再运行 `python main.py`。无参数运行会优先读取 `config.local.yaml`；也可以用 `--config` 指定其他配置文件。
+Python 3.11+。安装 `pip install -r requirements.txt`，然后运行 `playwright install chromium`，并安装 FFmpeg（使 `ffmpeg` 和 `ffprobe` 可用）。参考 `config.example.yaml` 配置，在本地 `config.yaml` 中填写链接和 MiMo API Key，再运行 `python main.py`。无参数运行会优先读取 `config.yaml`；也可以用 `--config` 指定其他配置文件。
 
 首次运行会打开可见浏览器。遇到登录或验证，请在浏览器中手动完成；访问不到的内容会记录到状态数据库和报告。独立命令：`collect`、`download`、`transcribe`、`report`。用 `python main.py --help` 查看所有配置覆盖选项。
 
-`config.local.yaml` 与浏览器会话可能包含凭证，不应上传；仓库中的 `config.yaml` 保持脱敏。报告在 `outputs/reports`，续跑状态在 `work/state.sqlite3`。采集仅能覆盖当前浏览器会话实际可见的公开视频和一级评论；页面变化或访问限制会降低覆盖率，报告会明确标注。
+`config.yaml` 与浏览器会话可能包含凭证，不应上传。报告在 `outputs/reports`，续跑状态在 `work/state.sqlite3`。默认尽量采集当前浏览器会话可见的全部一级评论及其回复，每个作品生成一份 `平台_作品ID.md` 报告，默认写出全部已采集评论。页面变化或访问限制会降低覆盖率，报告会标注是否确认完整及停止原因。旧数据库中已完成的评论会自动补采一次回复。
 
 ## 下载与转写排错
 

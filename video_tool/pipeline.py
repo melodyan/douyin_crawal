@@ -19,6 +19,7 @@ def _preserve(new: Video, old: Video | None):
     if old:
         new.comments_complete = old.comments_complete
         new.comments_stop_reason = old.comments_stop_reason
+        new.comments_version = old.comments_version
         new.transcript_status = old.transcript_status
         new.transcript = old.transcript
         new.transcript_error = old.transcript_error
@@ -29,7 +30,7 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
     old = store.get_video("douyin", identifier) if identifier else None
     if old and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]:
         media_done = old.transcript_status == ("images_saved" if old.content_type == "image" else "complete")
-        if old.metadata_status == "complete" and old.comments_complete and (not full or media_done):
+        if old.metadata_status == "complete" and old.comments_complete and old.comments_version >= 2 and (not full or media_done):
             LOG.info("跳过已完成视频 %s", old.video_id)
             return True
     try:
@@ -45,9 +46,19 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         _preserve(video, old)
     store.save_video(video)
     comments_failed = False
-    if not (old and old.comments_complete and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]):
+    if not (old and old.comments_complete and old.comments_version >= 2
+            and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]):
         try:
-            result = adapter.read_comments(video, config["crawl"]["max_comments_per_video"])
+            checkpoint = None
+            if not config["crawl"]["refresh_completed"]:
+                checkpoint = lambda partial: store.save_comments("douyin", video.video_id, partial)
+            result = adapter.read_comments(video, config["crawl"]["max_comments_per_video"],
+                                           on_progress=checkpoint,
+                                           existing=store.comments("douyin", video.video_id)
+                                           if (config["crawl"]["resume"]
+                                               and config["crawl"]["max_comments_per_video"] is None
+                                               and not config["crawl"]["refresh_completed"])
+                                           else None)
         except Exception as exc:
             LOG.error("评论采集失败 %s: %s", video.video_id, exc)
             result = CommentResult([], False, str(exc))
@@ -55,6 +66,7 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         store.save_comments("douyin", video.video_id, result, replace=config["crawl"]["refresh_completed"])
         video.comments_complete = result.complete
         video.comments_stop_reason = result.stop_reason
+        video.comments_version = 2
     media_done = old and old.transcript_status == ("images_saved" if video.content_type == "image" else "complete")
     if not full or (media_done and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]):
         return video.metadata_status == "complete" and not comments_failed
@@ -69,6 +81,12 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
             LOG.error("图文 %s 图片下载失败：%s", video.video_id, exc)
         store.save_video(video)
         return video.metadata_status == "complete" and video.transcript_status == "images_saved" and not comments_failed
+    if not video.media_urls:
+        video.transcript_status = "failed"
+        video.transcript_error = video.metadata_error or "页面未提供可下载的 HTTPS 媒体地址"
+        store.save_video(video)
+        LOG.error("视频 %s 下载失败：%s", video.video_id, video.transcript_error)
+        return False
     if not config["asr"]["api_key"]:
         video.transcript_status, video.transcript_error = "failed", "MiMo API Key 为空；请设置 asr.api_key 或 --mimo-api-key"
         store.save_video(video)
@@ -174,6 +192,8 @@ def download_one(config: dict, url: str) -> Path:
         if video.content_type == "image":
             folder = Path(config["download"]["output_dir"]) / video.video_id
             return download_images(video.image_urls, folder, config["audio"]["download_timeout_seconds"])
+        if not video.media_urls:
+            raise RuntimeError(video.metadata_error or "页面未提供可下载的 HTTPS 媒体地址")
         destination = Path(config["download"]["output_dir"]) / f"{video.video_id}.mp4"
         result = download(video.media_urls, destination, config["audio"]["download_timeout_seconds"])
         if not result.path:

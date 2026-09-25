@@ -5,7 +5,6 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from .models import Video
 from .storage import Store
 
 
@@ -28,25 +27,17 @@ def _quote(text: str) -> str:
 def generate(store: Store, config: dict) -> list[Path]:
     output = Path(config["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
-    groups: dict[tuple[str, str], list[Video]] = {}
-    for video in store.all_videos():
-        key = (video.platform, video.author_id or f"video_{video.video_id}")
-        groups.setdefault(key, []).append(video)
-    for discovery in store.all_discoveries():
-        if discovery["author_id"]:
-            groups.setdefault((discovery["platform"], discovery["author_id"]), [])
     paths = []
-    for (platform, author_id), videos in groups.items():
-        author_name = next((video.author_name for video in videos if video.author_name), "未知博主")
-        discoveries = store.discoveries(platform, author_id)
-        if author_name == "未知博主":
-            author_name = next((row["author_name"] for row in discoveries if row["author_name"]), "未知博主")
-        label = author_name if not author_id.startswith("video_") else videos[0].video_id
-        filename = f"{safe_filename(platform)}_{safe_filename(label)}_{safe_filename(author_id)}.md"
-        path = output / filename
-        lines = [f"# {escape(platform)} · {escape(author_name)}", "",
+    videos = store.all_videos()
+    for video in videos:
+        path = output / f"{safe_filename(video.platform)}_{safe_filename(video.video_id)}.md"
+        discoveries = store.discoveries(video.platform, video.author_id) if video.author_id else []
+        author_name = video.author_name or next(
+            (row["author_name"] for row in discoveries if row["author_name"]), "未知博主")
+        lines = [f"# {escape(video.title or '标题未读取')} · {escape(video.video_id)}", "",
+                 f"博主：{escape(author_name)}；平台：{escape(video.platform)}", "",
                  f"生成时间：{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
-                 f"作品条目：{len(videos)}", ""]
+                 ""]
         if discoveries:
             lines.append("## 主页采集覆盖情况")
             lines.append("")
@@ -56,44 +47,67 @@ def generate(store: Store, config: dict) -> list[Path]:
         else:
             lines.append("主页覆盖情况：未执行主页发现，或无法关联到已采集博主。")
         lines.append("")
-        omitted = []
-        for video in videos:
-            media_status = "images_saved" if video.content_type == "image" else "complete"
-            if not config["write_partial_results"] and (not video.title or not video.url or video.transcript_status != media_status):
-                omitted.append(video)
-                continue
-            lines.extend([f"## {escape(video.title or '标题未读取')} · {escape(video.video_id)}", "",
+        media_status = "images_saved" if video.content_type == "image" else "complete"
+        if not config["write_partial_results"] and (not video.title or not video.url or video.transcript_status != media_status):
+            continue
+        lines.extend(["## 作品信息", "",
                           f"- 作品类型：{'图文' if video.content_type == 'image' else '视频'}",
                           f"- 作品链接：{video.url}",
                           f"- 标题状态：{'已读取' if video.title else '无法读取'}",
                           f"- 元数据状态：{escape(video.metadata_status)}{('；' + escape(video.metadata_error)) if video.metadata_error else ''}"])
-            if video.tags_status == "present":
-                lines.append("- 原有话题：" + " ".join("\\#" + escape(tag) for tag in video.hashtags))
-            elif video.tags_status == "absent":
-                lines.append("- 原有话题：页面未显示话题")
-            else:
-                lines.append("- 原有话题：无法读取")
-            if video.content_type == "image":
-                lines.extend([f"- 图片状态：{escape(video.transcript_status)}{('；' + escape(video.transcript_error)) if video.transcript_error else ''}",
+        if video.tags_status == "present":
+            lines.append("- 原有话题：" + " ".join("\\#" + escape(tag) for tag in video.hashtags))
+        elif video.tags_status == "absent":
+            lines.append("- 原有话题：页面未显示话题")
+        else:
+            lines.append("- 原有话题：无法读取")
+        if video.content_type == "image":
+            lines.extend([f"- 图片状态：{escape(video.transcript_status)}{('；' + escape(video.transcript_error)) if video.transcript_error else ''}",
                               f"- 图片数量：{len(video.image_urls)}", ""])
-            else:
-                lines.extend([f"- 转写状态：{escape(video.transcript_status)}{('；' + escape(video.transcript_error)) if video.transcript_error else ''}",
+        else:
+            lines.extend([f"- 转写状态：{escape(video.transcript_status)}{('；' + escape(video.transcript_error)) if video.transcript_error else ''}",
                               "", "### 转写全文", "", _quote(video.transcript) if video.transcript else
                               ("> 尚未运行转写" if video.transcript_status == "pending" else "> 转写不可得"), ""])
-            comments = store.comments(platform, video.video_id)
-            label = "点赞最高的" if video.comments_complete else "已采集评论的点赞前"
-            top = comments[:config["top_comments"]]
-            lines.extend([f"### {label} {len(top)} 条一级评论", "",
-                          f"采集数量：{len(comments)}；覆盖：{'确认完整' if video.comments_complete else '未确认完整'}；停止原因：{escape(video.comments_stop_reason)}", ""])
-            if not top:
-                lines.extend(["（没有采集到可用一级评论）", ""])
-            for index, comment in enumerate(top, 1):
-                by = f" · {escape(comment.author)}" if config["include_comment_author"] and comment.author else ""
-                lines.extend([f"{index}. 赞 {comment.likes}{by}", "", _quote(comment.text), ""])
-        if omitted:
-            lines.extend(["## 未写入正文的作品", ""])
-            for video in omitted:
-                lines.append(f"- {escape(video.video_id)}：{escape(video.transcript_error or video.metadata_error or '标题、链接或转写未完成')}")
+        comments = store.comments(video.platform, video.video_id)
+        roots = [comment for comment in comments if not comment.parent_id]
+        replies: dict[str, list] = {}
+        for comment in comments:
+            if comment.parent_id:
+                replies.setdefault(comment.parent_id, []).append(comment)
+        selected = roots[:config["top_comments"]] if config["top_comments"] is not None else roots
+        shown = (len(comments) - len(roots) if config["top_comments"] is None else
+                 sum(len(replies.get(comment.comment_id, [])) for comment in selected))
+        lines.extend(["### 评论与回复", "",
+                      f"采集数量：{len(roots)} 条一级评论、{len(comments) - len(roots)} 条回复；"
+                      f"报告列出：{len(selected)} 条一级评论、{shown} 条回复；"
+                      f"覆盖：{'确认完整' if video.comments_complete else '未确认完整'}；"
+                      f"停止原因：{escape(video.comments_stop_reason)}", ""])
+        if not selected and not replies:
+            lines.extend(["（没有采集到可用评论）", ""])
+        for index, comment in enumerate(selected, 1):
+            by = f" · {escape(comment.author)}" if config["include_comment_author"] and comment.author else ""
+            lines.extend([f"#### {index}. 一级评论 · 赞 {comment.likes}{by}", "", _quote(comment.text), ""])
+            for reply in replies.pop(comment.comment_id, []):
+                by = f" · {escape(reply.author)}" if config["include_comment_author"] and reply.author else ""
+                lines.extend([f"- 回复 · 赞 {reply.likes}{by}", "", _quote(reply.text), ""])
+        if replies and config["top_comments"] is None:
+            lines.extend(["#### 未能关联一级评论的回复", ""])
+            for group in replies.values():
+                for reply in group:
+                    lines.extend([f"- 回复 {escape(reply.parent_id)} · 赞 {reply.likes}", "",
+                                  _quote(reply.text), ""])
         path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        paths.append(path)
+    represented = {(video.platform, video.author_id) for video in videos if video.author_id}
+    for discovery in store.all_discoveries():
+        key = (discovery["platform"], discovery["author_id"])
+        if key in represented:
+            continue
+        path = output / f"{safe_filename(discovery['platform'])}_profile_{safe_filename(discovery['author_id'] or 'unknown')}_discovery.md"
+        path.write_text(f"# {escape(discovery['platform'])} · {escape(discovery['author_name'] or '未知博主')}\n\n"
+                        f"主页：{escape(discovery['profile_url'])}\n\n"
+                        f"发现作品：{discovery['video_count']}；"
+                        f"覆盖：{'确认完整' if discovery['complete'] else '未确认完整'}；"
+                        f"原因：{escape(discovery['stop_reason'])}\n", encoding="utf-8")
         paths.append(path)
     return paths

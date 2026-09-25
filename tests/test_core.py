@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -12,7 +13,7 @@ from video_tool.config import DEFAULT_FILE, _walk, default_config_path, input_ur
 from video_tool.models import Comment, CommentResult, Discovery, SegmentResult, Video
 from video_tool.downloader import DownloadResult, download_images
 from video_tool.pipeline import collect_or_run, download_one
-from video_tool.platforms.douyin import DouyinAdapter, _comment_objects, likes_count, video_id
+from video_tool.platforms.douyin import DouyinAdapter, _comment_objects, _video_sources, likes_count, video_id
 from video_tool.reporter import generate
 from video_tool.storage import Store
 from video_tool.transcriber import Transcriber, merge_text
@@ -77,19 +78,141 @@ class CoreTests(unittest.TestCase):
             paths = generate(store, {"output_dir": root / "reports", "top_comments": 50,
                                      "include_comment_author": False, "write_partial_results": True})
             content = paths[0].read_text(encoding="utf-8")
-            self.assertIn("已采集评论的点赞前 50 条一级评论", content)
-            self.assertIn("采集数量：70", content)
+            self.assertIn("报告列出：50 条一级评论、0 条回复", content)
+            self.assertIn("采集数量：70 条一级评论", content)
             self.assertIn("媒体不可得", content)
             self.assertIn("&lt;script", content)
-            self.assertEqual(content.count(". 赞 "), 50)
+            self.assertEqual(content.count(". 一级评论 · 赞 "), 50)
             store.close()
 
     def test_comment_parser_and_merge(self):
         payload = {"comments": [{"cid": "1", "text": "一级", "reply_comment_total": 2, "reply_id": "0"},
                                 {"cid": "2", "text": "回复", "reply_id": "1"}]}
-        self.assertEqual([item["cid"] for item in _comment_objects(payload)], ["1"])
+        self.assertEqual([item["cid"] for item in _comment_objects(payload)], ["1", "2"])
         self.assertEqual(likes_count("1.2万"), 12000)
         self.assertEqual(merge_text("你好世界", "世界真好"), "你好世界真好")
+
+    def test_replies_are_collected_and_incomplete_replies_are_reported(self):
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter.page = Mock()
+        adapter.page.url = "https://www.douyin.com/video/123"
+        adapter.page.get_by_text.return_value.all.return_value = []
+        adapter.crawl = {"no_new_content_scrolls": 1, "delay_seconds": 0}
+        main_url = "https://www.douyin.com/aweme/v1/web/comment/list/?aweme_id=123"
+        reply_url = "https://www.douyin.com/aweme/v1/web/comment/list/reply/?aweme_id=123&comment_id=1"
+        main = {"status_code": 0, "has_more": 0, "comments": [
+            {"cid": "1", "text": "一级", "reply_id": "0", "reply_comment_total": 2}]}
+        reply = {"status_code": 0, "has_more": 0, "comments": [
+            {"cid": "2", "text": "回复一", "reply_id": "1"},
+            {"cid": "3", "text": "回复二", "reply_id": "1", "reply_to_reply_id": "2"}]}
+        adapter.responses = [(main_url, main), (reply_url, reply)]
+        result = adapter.read_comments(Video("douyin", "123", adapter.page.url), None)
+        self.assertTrue(result.complete)
+        self.assertEqual({item.comment_id: item.parent_id for item in result.comments},
+                         {"1": "", "2": "1", "3": "1"})
+        adapter.responses = [(main_url, main)]
+        result = adapter.read_comments(Video("douyin", "123", adapter.page.url), None)
+        self.assertFalse(result.complete)
+        self.assertIn("2 条回复未采集", result.stop_reason)
+        adapter.responses = [(main_url, main), (reply_url, {**reply, "has_more": 1})]
+        result = adapter.read_comments(Video("douyin", "123", adapter.page.url), None)
+        self.assertFalse(result.complete)
+        self.assertIn("1 个回复列表未到底", result.stop_reason)
+
+    def test_comment_scroll_loads_root_and_expand_more_loads_all_replies(self):
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter.crawl = {"no_new_content_scrolls": 3, "delay_seconds": 0}
+        adapter.responses = []
+        adapter.page = Mock()
+        adapter.page.url = "https://www.douyin.com/video/123"
+        main_url = "https://www.douyin.com/aweme/v1/web/comment/list/?aweme_id=123"
+        reply_url = "https://www.douyin.com/aweme/v1/web/comment/list/reply/?aweme_id=123&comment_id=1"
+        main = {"status_code": 0, "has_more": 0, "comments": [
+            {"cid": "1", "text": "一级评论", "reply_id": "0", "reply_comment_total": 2}]}
+        replies = [
+            {"status_code": 0, "has_more": 1, "comments": [
+                {"cid": "2", "text": "回复一", "reply_id": "1"}]},
+            {"status_code": 0, "has_more": 0, "comments": [
+                {"cid": "3", "text": "回复二", "reply_id": "1"}]},
+        ]
+        route = Mock()
+        route.first.count.return_value = 1
+        route.first.evaluate.side_effect = lambda _: adapter.responses.append((main_url, main))
+        button = Mock()
+        button.is_visible.return_value = True
+        button.click.side_effect = lambda **_: adapter.responses.append((reply_url, replies.pop(0)))
+        comment_items = Mock()
+        comment_items.filter.return_value.locator.return_value.filter.return_value.all.return_value = [button]
+        hidden = Mock()
+        hidden.first.is_visible.return_value = False
+        adapter.page.locator.side_effect = lambda selector: (
+            route if selector == ".route-scroll-container" else
+            comment_items if selector == '[data-e2e="comment-item"]' else hidden)
+        progress = Mock()
+        result = adapter.read_comments(Video("douyin", "123", adapter.page.url), 1,
+                                       on_progress=progress)
+        self.assertEqual(len(result.comments), 3)
+        self.assertEqual(sum(bool(item.parent_id) for item in result.comments), 2)
+        self.assertEqual(button.click.call_count, 2)
+        route.first.evaluate.assert_called_once()
+        self.assertEqual(progress.call_count, 3)
+        self.assertTrue(all(not call.args[0].complete for call in progress.call_args_list))
+        pattern = comment_items.filter.return_value.locator.return_value.filter.call_args.kwargs["has_text"]
+        self.assertIsNotNone(pattern.search("展开更多"))
+
+    def test_report_is_one_file_per_video_with_all_replies_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root / "state.sqlite3")
+            for identifier in ("123", "456"):
+                store.save_video(Video("douyin", identifier, f"https://www.douyin.com/video/{identifier}",
+                                       f"标题{identifier}", "same_author", "作者"))
+            store.save_comments("douyin", "123", CommentResult([
+                Comment("1", "一级", 1), Comment("2", "回复", 2, parent_id="1", reply_to_id="1")], True, "到底"))
+            self.assertEqual(store.comments("douyin", "123")[0].reply_to_id, "1")
+            paths = generate(store, {"output_dir": root / "reports", "top_comments": None,
+                                     "include_comment_author": False, "write_partial_results": True})
+            self.assertEqual({path.name for path in paths}, {"douyin_123.md", "douyin_456.md"})
+            first = (root / "reports" / "douyin_123.md").read_text(encoding="utf-8")
+            second = (root / "reports" / "douyin_456.md").read_text(encoding="utf-8")
+            self.assertIn("回复", first)
+            self.assertIn("报告列出：1 条一级评论、1 条回复", first)
+            self.assertNotIn("标题456", first)
+            self.assertNotIn("标题123", second)
+            store.close()
+
+    def test_existing_database_marks_old_comments_for_reply_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute("CREATE TABLE videos (platform TEXT, video_id TEXT, url TEXT, title TEXT, "
+                               "author_id TEXT, author_name TEXT, hashtags TEXT, tags_status TEXT, "
+                               "metadata_status TEXT, metadata_error TEXT, comments_complete INTEGER, "
+                               "comments_stop_reason TEXT, transcript_status TEXT, transcript TEXT, "
+                               "transcript_error TEXT, content_type TEXT, image_urls TEXT, updated_at TEXT, "
+                               "PRIMARY KEY (platform, video_id))")
+            connection.execute("INSERT INTO videos VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                               ("douyin", "123", "https://www.douyin.com/video/123", "标题", "a", "作者",
+                                "[]", "absent", "complete", "", 1, "到底", "complete", "转写", "",
+                                "video", "[]", ""))
+            connection.commit()
+            connection.close()
+            store = Store(path)
+            self.assertEqual(store.get_video("douyin", "123").comments_version, 1)
+            store.close()
+            config = load_config(DEFAULT_FILE)
+            config["runtime"]["state_db"] = path
+            old = Video("douyin", "123", "https://www.douyin.com/video/123", "标题",
+                        "a", "作者", metadata_status="complete")
+            adapter = Mock()
+            adapter.read_video.return_value = old
+            adapter.read_comments.return_value = CommentResult([], True, "到底")
+            with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter):
+                collect_or_run(config, [old.url], False)
+            adapter.read_comments.assert_called_once()
+            store = Store(path)
+            self.assertEqual(store.get_video("douyin", "123").comments_version, 2)
+            store.close()
 
     def test_inaccessible_profile_still_gets_report(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -209,6 +332,58 @@ class CoreTests(unittest.TestCase):
                                            ["https://cdn.example/2"]])
         self.assertEqual(post.media_urls, [])
         self.assertEqual(post.metadata_status, "complete")
+
+    def test_video_sources_include_bitrate_variants_and_all_matching_records(self):
+        url_a = "https://cdn.example/standard.mp4"
+        url_b = "https://cdn.example/high.mp4"
+        self.assertEqual(_video_sources({"video": {"play_addr": {"url_list": [url_a]},
+                                                     "bit_rate": [{"play_addr": {"url_list": [url_b]}}]}}),
+                         [url_a, url_b])
+        self.assertEqual(_video_sources({"video": {"play_addr": {"url_list": ["//cdn.example/video.mp4"]}}}),
+                         ["https://cdn.example/video.mp4"])
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter._navigate = lambda _: "https://www.douyin.com/video/123"
+        adapter.responses = [("https://www.douyin.com/aweme/detail", {"aweme_detail": {
+            "aweme_id": "123", "desc": "标题", "video": {"play_addr": {"url_list": [url_a]}}}}),
+            ("https://www.douyin.com/aweme/detail", {"aweme_detail": {
+                "aweme_id": "123", "video": {"bit_rate": [{"play_addr": {"url_list": [url_b]}}]}}})]
+        adapter._hydration = lambda: []
+        adapter.page = Mock()
+        post = adapter.read_video("https://www.douyin.com/video/123")
+        self.assertEqual(post.media_urls, [url_a, url_b])
+        self.assertEqual(post.title, "标题")
+
+    def test_video_player_source_does_not_need_video_id_in_url(self):
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter._navigate = lambda _: "https://www.douyin.com/video/123"
+        adapter.responses = [("https://www.douyin.com/aweme/detail", {"aweme_detail": {
+            "aweme_id": "123", "desc": "标题", "video": {}}})]
+        adapter._hydration = lambda: []
+        adapter.page = Mock()
+        adapter.page.locator.return_value.evaluate_all.return_value = ["https://cdn.example/opaque-path.mp4"]
+        post = adapter.read_video("https://www.douyin.com/video/123")
+        self.assertEqual(post.media_urls, ["https://cdn.example/opaque-path.mp4"])
+        self.assertEqual(post.metadata_status, "complete")
+
+    def test_video_reloads_once_when_first_page_has_no_media(self):
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter.page = Mock()
+        adapter.page.locator.return_value.first.is_visible.return_value = False
+        adapter.page.locator.return_value.evaluate_all.side_effect = RuntimeError("no player")
+        adapter._hydration = lambda: []
+        visits = []
+
+        def navigate(url):
+            visits.append(url)
+            media = {} if len(visits) == 1 else {"play_addr": {"url_list": ["https://cdn.example/movie.mp4"]}}
+            adapter.responses = [("https://www.douyin.com/aweme/detail", {"aweme_detail": {
+                "aweme_id": "123", "desc": "标题", "video": media}})]
+            return url
+
+        adapter._navigate = navigate
+        post = adapter.read_video("https://www.douyin.com/video/123")
+        self.assertEqual(len(visits), 2)
+        self.assertEqual(post.media_urls, ["https://cdn.example/movie.mp4"])
 
     def test_note_uses_rendered_album_when_aweme_images_are_missing(self):
         adapter = DouyinAdapter.__new__(DouyinAdapter)

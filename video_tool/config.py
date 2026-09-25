@@ -40,6 +40,7 @@ CHOICES = {
 ALIASES = {
     "inputs.max_videos_per_profile": "--inputs-no-video-limit",
     "crawl.max_comments_per_video": "--crawl-no-comment-limit",
+    "report.top_comments": "--report-no-comment-limit",
     "inputs.urls_file": "--no-urls-file",
 }
 
