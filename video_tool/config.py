@@ -31,6 +31,7 @@ INT_MIN = {
     "audio.mp3_bitrate_kbps": 16, "audio.download_timeout_seconds": 1,
     "asr.chunk_seconds": 1, "asr.overlap_seconds": 0, "asr.timeout_seconds": 1,
     "asr.max_retries": 0, "report.top_comments": 1,
+    "report.min_comment_chars": 0,
 }
 FLOAT_MIN = {"crawl.delay_seconds": 0, "crawl.retry_backoff_seconds": 0}
 CHOICES = {

@@ -22,6 +22,10 @@ def _quote(text: str) -> str:
     return "\n".join("> " + escape(line) for line in (text or "").splitlines()) or "> （空）"
 
 
+def comment_char_count(text: str) -> int:
+    return sum(not character.isspace() for character in text or "")
+
+
 def generate(store: Store, config: dict) -> list[Path]:
     output = Path(config["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
@@ -67,20 +71,27 @@ def generate(store: Store, config: dict) -> list[Path]:
                               "", "### 转写全文", "", _quote(video.transcript) if video.transcript else
                               ("> 尚未运行转写" if video.transcript_status == "pending" else "> 转写不可得"), ""])
         comments = store.comments(video.platform, video.video_id)
-        roots = [comment for comment in comments if not comment.parent_id]
+        min_chars = config.get("min_comment_chars", 50)
+        roots_all = [comment for comment in comments if not comment.parent_id]
+        replies_all = [comment for comment in comments if comment.parent_id]
+        roots = [comment for comment in roots_all if comment_char_count(comment.text) >= min_chars]
+        kept_replies = [comment for comment in replies_all if comment_char_count(comment.text) >= min_chars]
         replies: dict[str, list] = {}
-        for comment in comments:
-            if comment.parent_id:
-                replies.setdefault(comment.parent_id, []).append(comment)
+        for comment in kept_replies:
+            replies.setdefault(comment.parent_id, []).append(comment)
         selected = roots[:config["top_comments"]] if config["top_comments"] is not None else roots
-        shown = (len(comments) - len(roots) if config["top_comments"] is None else
-                 sum(len(replies.get(comment.comment_id, [])) for comment in selected))
+        eligible_root_ids = {comment.comment_id for comment in roots}
+        orphan_replies = [comment for comment in kept_replies if comment.parent_id not in eligible_root_ids]
+        shown = sum(len(replies.get(comment.comment_id, [])) for comment in selected) + len(orphan_replies)
         lines.extend(["### 评论与回复", "",
-                      f"采集数量：{len(roots)} 条一级评论、{len(comments) - len(roots)} 条回复；"
+                      f"采集数量：{len(roots_all)} 条一级评论、{len(replies_all)} 条回复；"
+                      f"字数门槛：至少 {min_chars} 字（不计空白）；"
+                      f"过滤：{len(roots_all) - len(roots)} 条一级评论、"
+                      f"{len(replies_all) - len(kept_replies)} 条回复；"
                       f"报告列出：{len(selected)} 条一级评论、{shown} 条回复；"
                       f"覆盖：{'确认完整' if video.comments_complete else '未确认完整'}；"
                       f"停止原因：{escape(video.comments_stop_reason)}", ""])
-        if not selected and not replies:
+        if not selected and not orphan_replies:
             lines.extend(["（没有采集到可用评论）", ""])
         for index, comment in enumerate(selected, 1):
             by = f" · {escape(comment.author)}" if config["include_comment_author"] and comment.author else ""
@@ -88,12 +99,11 @@ def generate(store: Store, config: dict) -> list[Path]:
             for reply in replies.pop(comment.comment_id, []):
                 by = f" · {escape(reply.author)}" if config["include_comment_author"] and reply.author else ""
                 lines.extend([f"- 回复 · 赞 {reply.likes}{by}", "", _quote(reply.text), ""])
-        if replies and config["top_comments"] is None:
+        if orphan_replies:
             lines.extend(["#### 未能关联一级评论的回复", ""])
-            for group in replies.values():
-                for reply in group:
-                    lines.extend([f"- 回复 {escape(reply.parent_id)} · 赞 {reply.likes}", "",
-                                  _quote(reply.text), ""])
+            for reply in orphan_replies:
+                lines.extend([f"- 回复 {escape(reply.parent_id)} · 赞 {reply.likes}", "",
+                              _quote(reply.text), ""])
         path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
         paths.append(path)
         for outdated in output.glob(f"*_{safe_filename(video.video_id, 32)}.md"):

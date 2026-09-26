@@ -80,6 +80,7 @@ class CoreTests(unittest.TestCase):
             store.save_discovery("douyin", "https://www.douyin.com/user/author1",
                                  Discovery([video.url], False, "连续滚动无新视频", "author1", "测试作者"))
             paths = generate(store, {"output_dir": root / "reports", "top_comments": 50,
+                                     "min_comment_chars": 0,
                                      "include_comment_author": False, "write_partial_results": True})
             content = paths[0].read_text(encoding="utf-8")
             self.assertIn("报告列出：50 条一级评论、0 条回复", content)
@@ -178,6 +179,7 @@ class CoreTests(unittest.TestCase):
             reports.mkdir()
             (reports / "douyin_123.md").write_text("# 标题123 · 123\n旧报告", encoding="utf-8")
             paths = generate(store, {"output_dir": root / "reports", "top_comments": None,
+                                     "min_comment_chars": 0,
                                      "include_comment_author": False, "write_partial_results": True})
             self.assertEqual({path.name for path in paths}, {"标题123_123.md", "标题456_456.md"})
             self.assertFalse((reports / "douyin_123.md").exists())
@@ -195,6 +197,36 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(video_stem(first), "同名_标题____123")
         self.assertNotEqual(video_stem(first), video_stem(second))
         self.assertEqual(safe_filename("CON"), "_CON")
+
+    def test_report_filters_short_comments_and_replies_without_losing_raw_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root / "state.sqlite3")
+            video = Video("douyin", "123", "https://www.douyin.com/video/123", "测试")
+            store.save_video(video)
+            store.save_comments("douyin", "123", CommentResult([
+                Comment("1", "甲" * 49),
+                Comment("2", "乙" * 50, parent_id="1"),
+                Comment("3", "丙" * 49 + " 丙"),
+                Comment("4", "丁" * 50),
+                Comment("5", "戊" * 49, parent_id="4"),
+                Comment("6", "己" * 50, parent_id="4"),
+            ], True, "到底"))
+            config = {"output_dir": root / "reports", "top_comments": None,
+                      "min_comment_chars": 50, "include_comment_author": False,
+                      "write_partial_results": True}
+            content = generate(store, config)[0].read_text(encoding="utf-8")
+            self.assertIn("过滤：1 条一级评论、1 条回复", content)
+            self.assertIn("报告列出：2 条一级评论、2 条回复", content)
+            self.assertNotIn("甲" * 49, content)
+            self.assertNotIn("戊" * 49, content)
+            self.assertIn("乙" * 50, content)
+            self.assertIn("未能关联一级评论的回复", content)
+            self.assertIn("丙" * 49 + " 丙", content)
+            config["min_comment_chars"] = 0
+            content = generate(store, config)[0].read_text(encoding="utf-8")
+            self.assertIn("报告列出：3 条一级评论、3 条回复", content)
+            store.close()
 
     def test_existing_database_marks_old_comments_for_reply_refresh(self):
         with tempfile.TemporaryDirectory() as directory:

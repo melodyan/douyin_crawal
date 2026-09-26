@@ -125,6 +125,9 @@ report:
   # 每份报告写入多少条点赞最高的一级评论及其回复；null 表示全部。
   top_comments: null  # --report-top-comments N；--report-no-comment-limit 清除上限
 
+  # 评论或回复少于此字数时不写入报告；不计空格和换行。0 表示不过滤。
+  min_comment_chars: 50  # --report-min-comment-chars N
+
   # 是否写出评论者昵称；关闭时仍写评论正文和点赞数。
   include_comment_author: false  # --report-include-comment-author / --no-report-include-comment-author
 
