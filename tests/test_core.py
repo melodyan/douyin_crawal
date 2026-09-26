@@ -10,10 +10,11 @@ import httpx
 import yaml
 
 from video_tool.config import DEFAULT_FILE, _walk, default_config_path, input_urls, load_config, parser_for, validate
-from video_tool.models import Comment, CommentResult, Discovery, SegmentResult, Video
+from video_tool.models import Collection, Comment, CommentResult, Discovery, SegmentResult, Video
 from video_tool.downloader import DownloadResult, download_images
+from video_tool.naming import safe_filename, video_stem
 from video_tool.pipeline import collect_or_run, download_one
-from video_tool.platforms.douyin import DouyinAdapter, _comment_objects, _video_sources, likes_count, video_id
+from video_tool.platforms.douyin import DouyinAdapter, _comment_objects, _video_sources, collection_id, likes_count, video_id
 from video_tool.reporter import generate
 from video_tool.storage import Store
 from video_tool.transcriber import Transcriber, merge_text
@@ -36,17 +37,20 @@ class CoreTests(unittest.TestCase):
                 name, "--" + name.replace(".", "-").replace("_", "-"))
             self.assertIn(expected_flag, flags, name)
         expected = ["--url", "--urls-file", "--inputs-max-videos-per-profile",
+                    "--inputs-max-videos-per-collection",
                     "--browser-headless", "--no-browser-headless", "--mimo-api-key",
                     "--report-output-dir", "--runtime-state-db"]
         self.assertTrue(set(expected) <= flags)
         args = parser.parse_args(["--url", "https://www.douyin.com/video/1", "--no-browser-headless",
-                                  "--report-top-comments", "20", "--urls-file", "inputs.txt"])
+                                  "--report-top-comments", "20", "--urls-file", "inputs.txt",
+                                  "--inputs-max-videos-per-collection", "2"])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "config.yaml.bak").write_text(DEFAULT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
             (root / "inputs.txt").write_text("https://www.douyin.com/video/2\nhttps://www.douyin.com/video/1\n", encoding="utf-8")
             config = load_config(root / "config.yaml.bak", args)
             self.assertEqual(config["report"]["top_comments"], 20)
+            self.assertEqual(config["inputs"]["max_videos_per_collection"], 2)
             self.assertEqual(config["inputs"]["urls_file"], root / "inputs.txt")
             self.assertEqual(len(input_urls(config)), 2)
             self.assertFalse(config["browser"]["headless"])
@@ -170,16 +174,27 @@ class CoreTests(unittest.TestCase):
             store.save_comments("douyin", "123", CommentResult([
                 Comment("1", "一级", 1), Comment("2", "回复", 2, parent_id="1", reply_to_id="1")], True, "到底"))
             self.assertEqual(store.comments("douyin", "123")[0].reply_to_id, "1")
+            reports = root / "reports"
+            reports.mkdir()
+            (reports / "douyin_123.md").write_text("# 标题123 · 123\n旧报告", encoding="utf-8")
             paths = generate(store, {"output_dir": root / "reports", "top_comments": None,
                                      "include_comment_author": False, "write_partial_results": True})
-            self.assertEqual({path.name for path in paths}, {"douyin_123.md", "douyin_456.md"})
-            first = (root / "reports" / "douyin_123.md").read_text(encoding="utf-8")
-            second = (root / "reports" / "douyin_456.md").read_text(encoding="utf-8")
+            self.assertEqual({path.name for path in paths}, {"标题123_123.md", "标题456_456.md"})
+            self.assertFalse((reports / "douyin_123.md").exists())
+            first = (reports / "标题123_123.md").read_text(encoding="utf-8")
+            second = (reports / "标题456_456.md").read_text(encoding="utf-8")
             self.assertIn("回复", first)
             self.assertIn("报告列出：1 条一级评论、1 条回复", first)
             self.assertNotIn("标题456", first)
             self.assertNotIn("标题123", second)
             store.close()
+
+    def test_title_based_filename_is_safe_and_distinguishes_duplicate_titles(self):
+        first = Video("douyin", "123", "https://www.douyin.com/video/123", "同名/标题:*?")
+        second = Video("douyin", "456", "https://www.douyin.com/video/456", "同名/标题:*?")
+        self.assertEqual(video_stem(first), "同名_标题____123")
+        self.assertNotEqual(video_stem(first), video_stem(second))
+        self.assertEqual(safe_filename("CON"), "_CON")
 
     def test_existing_database_marks_old_comments_for_reply_refresh(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -240,6 +255,69 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(checkpoint.video_urls, ["https://www.douyin.com/video/1"])
             self.assertFalse(checkpoint.complete)
             reopened.close()
+
+    def test_collection_discovery_follows_visible_pagination_in_order(self):
+        identifier = "7682002335945459746"
+        url = f"https://www.douyin.com/collection/{identifier}/1"
+        api = f"https://www.douyin.com/aweme/v1/web/mix/aweme/?mix_id={identifier}&cursor="
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter.crawl = {"no_new_content_scrolls": 2, "delay_seconds": 0}
+        adapter.responses = [(api + "0", {"status_code": 0, "cursor": 2, "has_more": 1,
+                                            "aweme_list": [{"aweme_id": "111", "desc": "第一集"},
+                                                           {"aweme_id": "222", "desc": "第二集"}]})]
+        adapter._navigate = Mock()
+        adapter.page = Mock()
+        adapter.page.locator.return_value.first.inner_text.return_value = "系列名称"
+        button = Mock()
+        button.is_visible.return_value = True
+        button.click.side_effect = lambda **_: adapter.responses.append(
+            (api + "2", {"status_code": 0, "cursor": 3, "has_more": 0,
+                          "aweme_list": [{"aweme_id": "222"}, {"aweme_id": "333"}]}))
+        adapter.page.get_by_text.return_value.all.side_effect = lambda: [button] if len(adapter.responses) == 1 else []
+        checkpoints = []
+        result = adapter.discover_collection(url, on_progress=checkpoints.append)
+        self.assertEqual(collection_id(url), identifier)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.video_urls, [f"https://www.douyin.com/video/{item}" for item in ("111", "222", "333")])
+        self.assertEqual(result.video_titles["111"], "第一集")
+        self.assertEqual(len(checkpoints), 2)
+        button.click.assert_called_once()
+
+    def test_collection_input_writes_ordered_index_and_resumes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = load_config(DEFAULT_FILE)
+            config["runtime"]["state_db"] = root / "state.sqlite3"
+            config["report"]["output_dir"] = root / "reports"
+            config["inputs"]["max_videos_per_collection"] = 2
+            identifier = "987"
+            source = f"https://www.douyin.com/collection/{identifier}/1"
+            urls = [f"https://www.douyin.com/video/{item}" for item in ("111", "222", "333")]
+            adapter = Mock()
+            adapter.discover_collection.return_value = Collection(
+                identifier, f"https://www.douyin.com/collection/{identifier}", "测试合集", urls, True, "到底",
+                {"111": "第一集 #话题", "222": "第二集", "333": "第三集"})
+            adapter.read_video.side_effect = [Video("douyin", item, url,
+                                                   f"第{index}集" + (" #话题" if index == 1 else ""),
+                                                   metadata_status="complete")
+                                              for index, (item, url) in enumerate(zip(("111", "222"), urls), 1)]
+            adapter.read_comments.return_value = CommentResult([], True, "到底")
+            with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter):
+                status = {}
+                collect_or_run(config, [source], False, status)
+            self.assertEqual(status["failed"], 0)
+            self.assertEqual(adapter.read_video.call_count, 2)
+            store = Store(root / "state.sqlite3")
+            self.assertEqual(store.get_collection("douyin", identifier).video_urls, urls)
+            self.assertEqual(store.get_collection("douyin", identifier).video_titles["111"], "第一集 #话题")
+            paths = generate(store, config["report"])
+            index = next(path for path in paths if path.name == f"douyin_collection_{identifier}.md")
+            content = index.read_text(encoding="utf-8")
+            self.assertLess(content.index("第1集"), content.index("第2集"))
+            self.assertIn("发现作品：3；覆盖：确认完整", content)
+            self.assertIn("第三集 · 待采集", content)
+            self.assertIn("%23", content)
+            store.close()
 
     def test_oversize_audio_is_split_before_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -436,16 +514,17 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = load_config(DEFAULT_FILE)
             config["download"]["output_dir"] = Path(directory)
-            post = Video("douyin", "123", "https://www.douyin.com/note/123", content_type="image",
+            post = Video("douyin", "123", "https://www.douyin.com/note/123", "图文标题", content_type="image",
                          image_urls=[["https://cdn.example/1"]])
             adapter = Mock()
             adapter.read_video.return_value = post
             with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter), \
-                 patch("video_tool.pipeline.download_images", return_value=Path(directory) / "123") as images, \
+                 patch("video_tool.pipeline.download_images", return_value=Path(directory) / "图文标题_123") as images, \
                  patch("video_tool.pipeline.download") as video_download:
                 result = download_one(config, post.url)
-            self.assertEqual(result, Path(directory) / "123")
+            self.assertEqual(result, Path(directory) / "图文标题_123")
             images.assert_called_once()
+            self.assertEqual(images.call_args.args[1], Path(directory) / "图文标题_123")
             video_download.assert_not_called()
 
     def test_run_downloads_note_without_transcriber(self):
@@ -480,7 +559,7 @@ class CoreTests(unittest.TestCase):
             config["report"]["output_dir"] = root / "reports"
             config["download"]["output_dir"] = root / "downloads"
             config["asr"]["api_key"] = "test"
-            media = root / "downloads" / "123.mp4"
+            media = root / "downloads" / "标题_123.mp4"
             media.parent.mkdir()
             media.write_bytes(b"media")
             video = Video("douyin", "123", "https://www.douyin.com/video/123", "标题",
@@ -490,11 +569,12 @@ class CoreTests(unittest.TestCase):
             adapter.read_video.return_value = video
             adapter.read_comments.return_value = CommentResult([Comment("1", "评论", 2)], True, "到底")
             with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter), \
-                 patch("video_tool.pipeline.download", return_value=DownloadResult(media, "video/mp4")), \
+                 patch("video_tool.pipeline.download", return_value=DownloadResult(media, "video/mp4")) as download_media, \
                  patch("video_tool.pipeline.Transcriber") as asr:
                 asr.return_value.transcribe.return_value = ("转写内容", [SegmentResult(0, 0, 1, "complete", "转写内容")])
                 paths = collect_or_run(config, [video.url], True)
                 self.assertIn("转写内容", paths[0].read_text(encoding="utf-8"))
+                self.assertEqual(download_media.call_args.args[1], media)
                 self.assertFalse(media.exists())
                 collect_or_run(config, [video.url], True)
                 self.assertEqual(adapter.read_video.call_count, 1)

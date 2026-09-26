@@ -10,10 +10,11 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from playwright.sync_api import sync_playwright
 
-from ..models import Comment, CommentResult, Discovery, Video
+from ..models import Collection, Comment, CommentResult, Discovery, Video
 
 LOG = logging.getLogger(__name__)
 VIDEO_RE = re.compile(r"/(?:video|note)/(\d+)")
+COLLECTION_RE = re.compile(r"/(?:collection|mix)/(\d+)(?:/|$)")
 HASHTAG_RE = re.compile(r"(?<!\w)#([^\s#]+)")
 
 
@@ -27,6 +28,11 @@ def video_id(url: str) -> str:
 
 def is_profile(url: str) -> bool:
     return "/user/" in urlparse(url).path
+
+
+def collection_id(url: str) -> str:
+    match = COLLECTION_RE.search(urlparse(url).path)
+    return match.group(1) if match else ""
 
 
 def likes_count(value) -> int:
@@ -358,6 +364,82 @@ class DouyinAdapter:
             if no_new >= self.crawl["no_new_content_scrolls"]:
                 break
         return Discovery(urls, complete, stop, author_id, author_name)
+
+    def discover_collection(self, url: str, previous: Collection | None = None,
+                            on_progress: Callable[[Collection], None] | None = None) -> Collection:
+        identifier = collection_id(url)
+        if not identifier:
+            raise ValueError(f"不是抖音合集链接: {url}")
+        canonical = f"https://www.douyin.com/collection/{identifier}"
+        # Douyin redirects a collection URL to its first episode. The episode list
+        # is still loaded on that page through the normal browser session.
+        self._navigate(url)
+        try:
+            name = self.page.locator('[data-e2e="cover-age-title-container"] h2').first.inner_text(timeout=2500).strip()
+        except Exception:
+            name = previous.name if previous else ""
+        urls: list[str] = []
+        titles: dict[str, str] = previous.video_titles.copy() if previous else {}
+        seen_ids: set[str] = set()
+        seen_pages: set[tuple[str, str]] = set()
+        response_index = 0
+        no_new = 0
+        complete = False
+        stop = "合集列表未确认到底"
+        while True:
+            new_responses = self.responses[response_index:]
+            response_index = len(self.responses)
+            page_seen = False
+            for response_url, payload in new_responses:
+                if "/mix/aweme/" not in urlparse(response_url).path:
+                    continue
+                query = parse_qs(urlparse(response_url).query)
+                if (query.get("mix_id") or [""])[0] != identifier or payload.get("status_code") != 0:
+                    continue
+                request_cursor = (query.get("cursor") or [""])[0]
+                page_key = (request_cursor, str(payload.get("cursor")))
+                if page_key in seen_pages:
+                    continue
+                seen_pages.add(page_key)
+                page_seen = True
+                items = payload.get("aweme_list")
+                if not isinstance(items, list):
+                    stop = "合集页面返回了无法解析的作品列表"
+                    continue
+                for item in items:
+                    if not isinstance(item, dict) or not str(item.get("aweme_id") or "").isdigit():
+                        continue
+                    target = _content_url(item)
+                    target_id = video_id(target)
+                    if item.get("desc"):
+                        titles[target_id] = str(item["desc"]).strip()
+                    if target_id not in seen_ids:
+                        seen_ids.add(target_id)
+                        urls.append(target)
+                if on_progress:
+                    on_progress(Collection(identifier, canonical, name, urls.copy(), False,
+                                           "采集中", titles.copy()))
+                if payload.get("has_more") in (0, False):
+                    complete, stop = True, "合集页面响应确认列表到底"
+            if complete:
+                break
+            more_buttons = self.page.get_by_text("点击加载更多", exact=True).all()
+            visible = next((button for button in more_buttons if button.is_visible()), None)
+            if visible:
+                try:
+                    visible.click(timeout=5000)
+                except Exception:
+                    stop = "合集下一页无法打开"
+                    break
+            elif not seen_pages:
+                stop = "页面未提供可用的合集作品列表"
+            no_new = 0 if page_seen else no_new + 1
+            if no_new >= self.crawl["no_new_content_scrolls"]:
+                break
+            self.page.wait_for_timeout(max(900, int(self.crawl["delay_seconds"] * 1000)))
+        if not complete and previous:
+            urls.extend(item for item in previous.video_urls if video_id(item) not in seen_ids)
+        return Collection(identifier, canonical, name, urls, complete, stop, titles)
 
     def read_video(self, url: str, _retry_media: bool = True) -> Video:
         final = self._navigate(url)

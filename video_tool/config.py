@@ -25,6 +25,7 @@ PATH_KEYS = {
 }
 INT_MIN = {
     "inputs.max_videos_per_profile": 1, "browser.navigation_timeout_seconds": 1,
+    "inputs.max_videos_per_collection": 1,
     "browser.manual_wait_seconds": 0, "crawl.max_retries": 0,
     "crawl.max_comments_per_video": 1, "crawl.no_new_content_scrolls": 1,
     "audio.mp3_bitrate_kbps": 16, "audio.download_timeout_seconds": 1,
@@ -39,6 +40,7 @@ CHOICES = {
 }
 ALIASES = {
     "inputs.max_videos_per_profile": "--inputs-no-video-limit",
+    "inputs.max_videos_per_collection": "--inputs-no-collection-limit",
     "crawl.max_comments_per_video": "--crawl-no-comment-limit",
     "report.top_comments": "--report-no-comment-limit",
     "inputs.urls_file": "--no-urls-file",

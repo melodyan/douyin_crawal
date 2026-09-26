@@ -7,7 +7,8 @@ from urllib.parse import urlparse
 
 from .downloader import download, download_images
 from .models import CommentResult, Video
-from .platforms.douyin import DouyinAdapter, is_profile, video_id
+from .naming import video_stem
+from .platforms.douyin import DouyinAdapter, collection_id, is_profile, video_id
 from .reporter import generate
 from .storage import Store
 from .transcriber import Transcriber
@@ -72,7 +73,7 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         return video.metadata_status == "complete" and not comments_failed
     if video.content_type == "image":
         try:
-            folder = Path(config["download"]["output_dir"]) / video.video_id
+            folder = Path(config["download"]["output_dir"]) / video_stem(video)
             download_images(video.image_urls, folder, config["audio"]["download_timeout_seconds"])
             video.transcript_status, video.transcript_error = "images_saved", ""
             LOG.info("图文 %s 已保存图片：%s", video.video_id, folder)
@@ -100,7 +101,7 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         store.save_video(video)
         LOG.error("视频 %s 转写前检查失败：%s", video.video_id, exc)
         return False
-    media_path = Path(config["download"]["output_dir"]) / f"{video.video_id}.mp4"
+    media_path = Path(config["download"]["output_dir"]) / f"{video_stem(video)}.mp4"
     LOG.info("视频 %s 开始下载临时媒体", video.video_id)
     result = download(video.media_urls, media_path, config["audio"]["download_timeout_seconds"])
     if not result.path:
@@ -146,9 +147,23 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
             try:
                 resolved = input_url
                 profile = is_profile(input_url)
-                if not profile and not video_id(input_url):
+                collection = bool(collection_id(input_url))
+                if not profile and not collection and not video_id(input_url):
                     resolved, profile = adapter.resolve_kind(input_url)
-                if profile:
+                    collection = bool(collection_id(resolved))
+                if collection:
+                    identifier = collection_id(resolved)
+                    previous = store.get_collection("douyin", identifier) if config["crawl"]["resume"] else None
+                    discovery = adapter.discover_collection(
+                        resolved, previous,
+                        on_progress=lambda partial: store.save_collection("douyin", partial))
+                    store.save_collection("douyin", discovery)
+                    LOG.info("合集发现 %s：%s 条，%s，%s", discovery.url,
+                             len(discovery.video_urls), "完整" if discovery.complete else "未确认完整",
+                             discovery.stop_reason)
+                    limit = config["inputs"]["max_videos_per_collection"]
+                    targets = discovery.video_urls[:limit] if limit is not None else discovery.video_urls
+                elif profile:
                     previous = store.get_discovery("douyin", resolved) if config["crawl"]["resume"] else None
                     if previous and previous.complete and not config["crawl"]["refresh_completed"]:
                         discovery = previous
@@ -165,7 +180,7 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                 for target in targets:
                     if not _process_video(adapter, store, target, config, full):
                         failures += 1
-                if profile and not targets and not discovery.complete:
+                if (profile or collection) and not targets and not discovery.complete:
                     failures += 1
             except KeyboardInterrupt:
                 raise
@@ -176,6 +191,14 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                     from .models import Discovery
                     author_id = urlparse(input_url).path.rstrip("/").split("/")[-1]
                     store.save_discovery("douyin", input_url, Discovery([], False, str(exc), author_id))
+                elif collection_id(input_url):
+                    from .models import Collection
+                    identifier = collection_id(input_url)
+                    prior = store.get_collection("douyin", identifier)
+                    store.save_collection("douyin", Collection(
+                        identifier, f"https://www.douyin.com/collection/{identifier}",
+                        prior.name if prior else "", prior.video_urls if prior else [],
+                        False, str(exc), prior.video_titles if prior else {}))
         if status is not None:
             status["failed"] = failures
         return generate(store, config["report"]) if full else []
@@ -190,11 +213,11 @@ def download_one(config: dict, url: str) -> Path:
     try:
         video = adapter.read_video(url)
         if video.content_type == "image":
-            folder = Path(config["download"]["output_dir"]) / video.video_id
+            folder = Path(config["download"]["output_dir"]) / video_stem(video)
             return download_images(video.image_urls, folder, config["audio"]["download_timeout_seconds"])
         if not video.media_urls:
             raise RuntimeError(video.metadata_error or "页面未提供可下载的 HTTPS 媒体地址")
-        destination = Path(config["download"]["output_dir"]) / f"{video.video_id}.mp4"
+        destination = Path(config["download"]["output_dir"]) / f"{video_stem(video)}.mp4"
         result = download(video.media_urls, destination, config["audio"]["download_timeout_seconds"])
         if not result.path:
             raise RuntimeError(result.error)

@@ -4,7 +4,9 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
+from .naming import safe_filename, video_stem
 from .storage import Store
 
 
@@ -14,10 +16,6 @@ def escape(text: str) -> str:
     text = text.replace("\\", "\\\\")
     text = re.sub(r"([`*_{}\[\]()#+\-.!|>])", r"\\\1", text)
     return text
-
-
-def safe_filename(value: str) -> str:
-    return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", value).strip(" .")[:100] or "unknown"
 
 
 def _quote(text: str) -> str:
@@ -30,7 +28,7 @@ def generate(store: Store, config: dict) -> list[Path]:
     paths = []
     videos = store.all_videos()
     for video in videos:
-        path = output / f"{safe_filename(video.platform)}_{safe_filename(video.video_id)}.md"
+        path = output / f"{video_stem(video)}.md"
         discoveries = store.discoveries(video.platform, video.author_id) if video.author_id else []
         author_name = video.author_name or next(
             (row["author_name"] for row in discoveries if row["author_name"]), "未知博主")
@@ -98,6 +96,12 @@ def generate(store: Store, config: dict) -> list[Path]:
                                   _quote(reply.text), ""])
         path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
         paths.append(path)
+        for outdated in output.glob(f"*_{safe_filename(video.video_id, 32)}.md"):
+            if outdated == path:
+                continue
+            first_line = outdated.read_text(encoding="utf-8").splitlines()[:1]
+            if first_line and first_line[0].endswith(f" · {video.video_id}"):
+                outdated.unlink()
     represented = {(video.platform, video.author_id) for video in videos if video.author_id}
     for discovery in store.all_discoveries():
         key = (discovery["platform"], discovery["author_id"])
@@ -109,5 +113,28 @@ def generate(store: Store, config: dict) -> list[Path]:
                         f"发现作品：{discovery['video_count']}；"
                         f"覆盖：{'确认完整' if discovery['complete'] else '未确认完整'}；"
                         f"原因：{escape(discovery['stop_reason'])}\n", encoding="utf-8")
+        paths.append(path)
+    by_id = {(video.platform, video.video_id): video for video in videos}
+    generated_names = {path.name for path in paths}
+    for collection in store.all_collections():
+        path = output / f"douyin_collection_{safe_filename(collection.collection_id)}.md"
+        lines = [f"# 合集 · {escape(collection.name or collection.collection_id)}", "",
+                 f"合集链接：{collection.url}", "",
+                 f"发现作品：{len(collection.video_urls)}；"
+                 f"覆盖：{'确认完整' if collection.complete else '未确认完整'}；"
+                 f"原因：{escape(collection.stop_reason)}", "", "## 作品目录", ""]
+        for index, url in enumerate(collection.video_urls, 1):
+            match = re.search(r"/(?:video|note)/(\d+)", url)
+            identifier = match.group(1) if match else ""
+            video = by_id.get(("douyin", identifier))
+            label = escape(video.title if video and video.title else
+                           collection.video_titles.get(identifier) or identifier or url)
+            report_name = f"{video_stem(video)}.md" if video else ""
+            title = f"[{label}]({quote(report_name, safe='')})" if report_name in generated_names else label
+            state = (f"转写 {escape(video.transcript_status)}；"
+                     f"评论{'完整' if video.comments_complete else '未确认完整'}"
+                     if video else "待采集")
+            lines.append(f"{index}. {title} · {state} · [原作品]({url})")
+        path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
         paths.append(path)
     return paths

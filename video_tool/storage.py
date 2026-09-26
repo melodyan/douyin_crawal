@@ -5,7 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .models import Comment, CommentResult, Discovery, SegmentResult, Video
+from .models import Collection, Comment, CommentResult, Discovery, SegmentResult, Video
 
 
 class Store:
@@ -47,6 +47,14 @@ class Store:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (platform, profile_url)
             );
+            CREATE TABLE IF NOT EXISTS collections (
+                platform TEXT NOT NULL, collection_id TEXT NOT NULL, url TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '', complete INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT NOT NULL DEFAULT '未采集', video_urls TEXT NOT NULL DEFAULT '[]',
+                video_titles TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (platform, collection_id)
+            );
         """)
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(discoveries)")}
         if "video_urls" not in columns:
@@ -63,6 +71,9 @@ class Store:
             self.db.execute("ALTER TABLE comments ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''")
         if "reply_to_id" not in comment_columns:
             self.db.execute("ALTER TABLE comments ADD COLUMN reply_to_id TEXT NOT NULL DEFAULT ''")
+        collection_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(collections)")}
+        if "video_titles" not in collection_columns:
+            self.db.execute("ALTER TABLE collections ADD COLUMN video_titles TEXT NOT NULL DEFAULT '{}'")
         self.db.commit()
 
     def close(self):
@@ -163,3 +174,29 @@ class Store:
 
     def all_discoveries(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM discoveries ORDER BY platform,author_id,profile_url").fetchall()
+
+    def save_collection(self, platform: str, result: Collection):
+        self.db.execute("""INSERT INTO collections
+            (platform,collection_id,url,name,complete,stop_reason,video_urls,video_titles)
+            VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(platform,collection_id) DO UPDATE SET
+            url=excluded.url,name=excluded.name,complete=excluded.complete,
+            stop_reason=excluded.stop_reason,video_urls=excluded.video_urls,video_titles=excluded.video_titles,
+            updated_at=CURRENT_TIMESTAMP""",
+            (platform, result.collection_id, result.url, result.name, int(result.complete),
+             result.stop_reason, json.dumps(result.video_urls, ensure_ascii=False),
+             json.dumps(result.video_titles, ensure_ascii=False)))
+        self.db.commit()
+
+    def get_collection(self, platform: str, collection_id: str) -> Collection | None:
+        row = self.db.execute("SELECT * FROM collections WHERE platform=? AND collection_id=?",
+                              (platform, collection_id)).fetchone()
+        return (Collection(row["collection_id"], row["url"], row["name"],
+                           json.loads(row["video_urls"]), bool(row["complete"]), row["stop_reason"],
+                           json.loads(row["video_titles"]))
+                if row else None)
+
+    def all_collections(self) -> list[Collection]:
+        return [Collection(row["collection_id"], row["url"], row["name"],
+                           json.loads(row["video_urls"]), bool(row["complete"]), row["stop_reason"],
+                           json.loads(row["video_titles"]))
+                for row in self.db.execute("SELECT * FROM collections ORDER BY platform,collection_id")]

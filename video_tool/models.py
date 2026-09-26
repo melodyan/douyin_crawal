@@ -47,6 +47,17 @@ class Discovery:
 
 
 @dataclass
+class Collection:
+    collection_id: str
+    url: str
+    name: str = ""
+    video_urls: list[str] = field(default_factory=list)
+    complete: bool = False
+    stop_reason: str = "未采集"
+    video_titles: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class CommentResult:
     comments: list[Comment]
     complete: bool

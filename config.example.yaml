@@ -15,6 +15,7 @@ inputs:
   # urls:
   #   - "https://www.douyin.com/video/实际视频ID"
   #   - "https://www.douyin.com/user/实际用户标识"
+  #   - "https://www.douyin.com/collection/实际合集ID/1"
   urls: []  # --url URL，可重复传入多个；命令行传入时替换此列表
 
   # 装有链接的纯文本文件路径，不是抖音网址。文件中每行写一个完整链接。
@@ -25,6 +26,9 @@ inputs:
   # 输入博主主页时，最多处理多少条视频；null 表示尽量遍历全部公开视频。
   # 对单独输入的视频链接不起作用。填 100 就只处理该主页前 100 条。
   max_videos_per_profile: null  # --inputs-max-videos-per-profile N；--inputs-no-video-limit 清除上限
+
+  # 输入合集链接时，本次最多处理多少条作品；null 表示全部。合集目录始终记录发现的完整列表。
+  max_videos_per_collection: null  # --inputs-max-videos-per-collection N；--inputs-no-collection-limit 清除上限
 
 browser:
   # false 打开可见浏览器，方便手动登录和处理验证；true 在后台运行。
@@ -76,7 +80,7 @@ audio:
   # 获取单条视频媒体内容最多等待多少秒。
   download_timeout_seconds: 120  # --audio-download-timeout-seconds N
 
-  # false 转写后删除临时媒体；true 保留在工作目录供复核。
+  # 完整流程中，false 转写后删除下载的视频；true 保留视频文件。
   # 100–1000 条视频若全部保留，会占用大量磁盘空间。
   keep_temporary_files: false  # --audio-keep-temporary-files / --no-audio-keep-temporary-files
 
