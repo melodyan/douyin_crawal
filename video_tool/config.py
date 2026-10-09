@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from copy import deepcopy
 from pathlib import Path
 from urllib.parse import urlparse
@@ -46,6 +47,8 @@ ALIASES = {
     "report.top_comments": "--report-no-comment-limit",
     "inputs.urls_file": "--no-urls-file",
 }
+SHARE_URL_RE = re.compile(r'https?://[^\s<>"\']+')
+TRAILING_URL_PUNCTUATION = ".,;:!?)]}，。！？；：、】【）】》」』"
 
 
 def _walk(mapping: dict, prefix: str = ""):
@@ -86,6 +89,8 @@ def _add_options(parser: argparse.ArgumentParser, defaults: dict):
             flags = list(dict.fromkeys((leaf_flag, flag)))
             if name == "inputs.urls_file":
                 flags.append("--urls-file")
+            if name == "crawl.refresh_completed":
+                flags.append("--force-reprocess")
             if isinstance(value, bool):
                 parser.add_argument(*flags, dest=dest, action="store_true", default=argparse.SUPPRESS)
                 negative = list(dict.fromkeys(("--no-" + name.replace(".", "-"),
@@ -116,7 +121,8 @@ def parser_for(defaults: dict) -> argparse.ArgumentParser:
 def load_config(path: Path, overrides: argparse.Namespace | None = None) -> dict:
     path = path.resolve()
     defaults = yaml.safe_load(DEFAULT_FILE.read_text(encoding="utf-8"))
-    supplied = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    source = path.read_text(encoding="utf-8")
+    supplied = yaml.safe_load(source) or {}
     if not isinstance(supplied, dict):
         raise ValueError("配置文件必须是 YAML 对象")
     config = deepcopy(defaults)
@@ -134,6 +140,9 @@ def load_config(path: Path, overrides: argparse.Namespace | None = None) -> dict
                 target[key] = value
 
     merge(config, supplied, defaults)
+    share_urls = _share_urls_from_config_source(source)
+    if share_urls:
+        config["inputs"]["urls"] = share_urls
     if overrides:
         values = vars(overrides)
         for name, _ in _walk(defaults):
@@ -203,4 +212,43 @@ def input_urls(config: dict) -> list[str]:
         urls.extend(line.strip() for line in Path(file).read_text(encoding="utf-8-sig").splitlines() if line.strip() and not line.lstrip().startswith("#"))
     if any(not isinstance(url, str) for url in urls):
         raise ValueError("inputs.urls 只能包含 URL 字符串")
-    return list(dict.fromkeys(url.strip() for url in urls if url.strip()))
+    return list(dict.fromkeys(_share_url(url) for url in urls if url.strip()))
+
+
+def _share_url(value: str) -> str:
+    """Extract the first official Douyin URL from a copied share message."""
+    value = value.strip()
+    for match in SHARE_URL_RE.finditer(value):
+        candidate = match.group().rstrip(TRAILING_URL_PUNCTUATION)
+        host = (urlparse(candidate).hostname or "").lower()
+        if host == "douyin.com" or host.endswith(".douyin.com") or host == "iesdouyin.com" or host.endswith(".iesdouyin.com"):
+            return candidate
+    return value
+
+
+def _share_urls_from_config_source(source: str) -> list[str]:
+    """Recover links after YAML treats a share message's hashtag as a comment."""
+    urls = []
+    in_inputs = False
+    in_urls = False
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indentation = len(line) - len(line.lstrip())
+        if indentation == 0:
+            in_inputs = bool(re.match(r"inputs\s*:", stripped))
+            in_urls = False
+            continue
+        if not in_inputs:
+            continue
+        if indentation == 2:
+            in_urls = bool(re.match(r"urls\s*:", stripped))
+            continue
+        if not in_urls or indentation != 4 or not stripped.startswith("- "):
+            continue
+        url = _share_url(stripped[2:])
+        host = (urlparse(url).hostname or "").lower()
+        if host == "douyin.com" or host.endswith(".douyin.com") or host == "iesdouyin.com" or host.endswith(".iesdouyin.com"):
+            urls.append(url)
+    return list(dict.fromkeys(urls))

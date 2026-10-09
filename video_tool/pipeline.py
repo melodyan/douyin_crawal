@@ -26,13 +26,34 @@ def _preserve(new: Video, old: Video | None):
         new.transcript_error = old.transcript_error
 
 
+def _media_done(video: Video) -> bool:
+    return video.transcript_status == ("images_saved" if video.content_type == "image" else "complete")
+
+
+def _log_skipped_media(video: Video, config: dict):
+    if video.content_type == "image":
+        LOG.info("图文 %s 已保存图片，跳过媒体下载", video.video_id)
+        return
+    media_path = Path(config["download"]["output_dir"]) / f"{video_stem(video)}.mp4"
+    if config["audio"]["keep_temporary_files"] and media_path.is_file():
+        LOG.info("视频 %s 已下载并转写完成，媒体文件存在，跳过下载和转写", video.video_id)
+    elif config["audio"]["keep_temporary_files"]:
+        LOG.info("视频 %s 已下载并转写完成，但媒体文件不存在，跳过下载和转写", video.video_id)
+    else:
+        LOG.info("视频 %s 已下载并转写完成，临时媒体已按配置删除，跳过下载和转写", video.video_id)
+
+
 def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict, full: bool) -> bool:
     identifier = video_id(url)
     old = store.get_video("douyin", identifier) if identifier else None
+    if old and config["crawl"]["refresh_completed"]:
+        LOG.info("强制重跑视频 %s，忽略已完成状态", old.video_id)
     if old and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]:
-        media_done = old.transcript_status == ("images_saved" if old.content_type == "image" else "complete")
+        media_done = _media_done(old)
         if old.metadata_status == "complete" and old.comments_complete and old.comments_version >= 2 and (not full or media_done):
-            LOG.info("跳过已完成视频 %s", old.video_id)
+            if full and media_done:
+                _log_skipped_media(old, config)
+            LOG.info("视频 %s 已完成全部处理，跳过", old.video_id)
             return True
     try:
         video = adapter.read_video(url)
@@ -68,8 +89,10 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         video.comments_complete = result.complete
         video.comments_stop_reason = result.stop_reason
         video.comments_version = 2
-    media_done = old and old.transcript_status == ("images_saved" if video.content_type == "image" else "complete")
+    media_done = bool(old and _media_done(old))
     if not full or (media_done and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]):
+        if full and media_done:
+            _log_skipped_media(old, config)
         return video.metadata_status == "complete" and not comments_failed
     if video.content_type == "image":
         try:
@@ -141,6 +164,9 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
     store = Store(Path(config["runtime"]["state_db"]))
     adapter = None
     failures = 0
+    active_video_ids: set[str] = set()
+    active_collection_ids: set[str] = set()
+    active_profile_urls: set[str] = set()
     try:
         adapter = DouyinAdapter(config["browser"], config["crawl"])
         for input_url in urls:
@@ -151,8 +177,10 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                 if not profile and not collection and not video_id(input_url):
                     resolved, profile = adapter.resolve_kind(input_url)
                     collection = bool(collection_id(resolved))
+                    LOG.info("输入链接跳转：%s -> %s", input_url, resolved)
                 if collection:
                     identifier = collection_id(resolved)
+                    active_collection_ids.add(identifier)
                     previous = store.get_collection("douyin", identifier) if config["crawl"]["resume"] else None
                     discovery = adapter.discover_collection(
                         resolved, previous,
@@ -164,6 +192,7 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                     limit = config["inputs"]["max_videos_per_collection"]
                     targets = discovery.video_urls[:limit] if limit is not None else discovery.video_urls
                 elif profile:
+                    active_profile_urls.add(resolved)
                     previous = store.get_discovery("douyin", resolved) if config["crawl"]["resume"] else None
                     if previous and previous.complete and not config["crawl"]["refresh_completed"]:
                         discovery = previous
@@ -178,6 +207,9 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                 else:
                     targets = [resolved]
                 for target in targets:
+                    identifier = video_id(target)
+                    if identifier:
+                        active_video_ids.add(identifier)
                     if not _process_video(adapter, store, target, config, full):
                         failures += 1
                 if (profile or collection) and not targets and not discovery.complete:
@@ -201,7 +233,9 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                         False, str(exc), prior.video_titles if prior else {}))
         if status is not None:
             status["failed"] = failures
-        return generate(store, config["report"]) if full else []
+        return (generate(store, config["report"], video_ids=active_video_ids,
+                         collection_ids=active_collection_ids,
+                         profile_urls=active_profile_urls) if full else [])
     finally:
         if adapter:
             adapter.close()

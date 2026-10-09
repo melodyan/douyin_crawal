@@ -39,7 +39,7 @@ class CoreTests(unittest.TestCase):
         expected = ["--url", "--urls-file", "--inputs-max-videos-per-profile",
                     "--inputs-max-videos-per-collection",
                     "--browser-headless", "--no-browser-headless", "--mimo-api-key",
-                    "--report-output-dir", "--runtime-state-db"]
+                    "--report-output-dir", "--runtime-state-db", "--force-reprocess"]
         self.assertTrue(set(expected) <= flags)
         args = parser.parse_args(["--url", "https://www.douyin.com/video/1", "--no-browser-headless",
                                   "--report-top-comments", "20", "--urls-file", "inputs.txt",
@@ -55,6 +55,38 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(len(input_urls(config)), 2)
             self.assertFalse(config["browser"]["headless"])
             validate(config, "collect", input_urls(config))
+
+        args = parser.parse_args(["run", "--force-reprocess", "--url", "https://www.douyin.com/video/1"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(DEFAULT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+            self.assertTrue(load_config(path, args)["crawl"]["refresh_completed"])
+
+    def test_input_urls_extracts_douyin_short_link_from_share_text(self):
+        config = load_config(DEFAULT_FILE)
+        config["inputs"]["urls"] = [
+            "2.35 :7pm Q@X.MJ wsr:/ 零基础搭 AI 知识库 "
+            "https://v.douyin.com/mnk7O2rjeEE/ 复制此链接，打开抖音搜索，直接观看视频！"
+        ]
+        urls = input_urls(config)
+        self.assertEqual(urls, ["https://v.douyin.com/mnk7O2rjeEE/"])
+        validate(config, "download", urls)
+
+    def test_load_config_extracts_links_after_unquoted_hashtags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "platform: douyin\n"
+                "inputs:\n"
+                "  urls:\n"
+                "    - 2.35 copied share # AI学习 https://v.douyin.com/mnk7O2rjeEE/\n"
+                "    - 3.14 another share # 知识管理 https://v.douyin.com/AK3-JAxmBcc/\n",
+                encoding="utf-8")
+            config = load_config(path)
+            self.assertEqual(input_urls(config), [
+                "https://v.douyin.com/mnk7O2rjeEE/",
+                "https://v.douyin.com/AK3-JAxmBcc/",
+            ])
 
     def test_command_specific_validation(self):
         config = load_config(DEFAULT_FILE)
@@ -610,6 +642,94 @@ class CoreTests(unittest.TestCase):
                 self.assertFalse(media.exists())
                 collect_or_run(config, [video.url], True)
                 self.assertEqual(adapter.read_video.call_count, 1)
+
+    def test_run_skips_download_and_transcription_after_completed_transcript(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = load_config(DEFAULT_FILE)
+            config["runtime"]["state_db"] = root / "state.sqlite3"
+            config["report"]["output_dir"] = root / "reports"
+            config["download"]["output_dir"] = root / "downloads"
+            config["audio"]["keep_temporary_files"] = True
+            previous = Video("douyin", "123", "https://www.douyin.com/video/123", "标题",
+                             metadata_status="complete", transcript_status="complete")
+            store = Store(config["runtime"]["state_db"])
+            store.save_video(previous)
+            store.close()
+            adapter = Mock()
+            adapter.read_video.return_value = Video(
+                "douyin", "123", previous.url, "标题", metadata_status="complete",
+                media_urls=["https://media.example/video.mp4"])
+            adapter.read_comments.return_value = CommentResult([], False, "未到底")
+            with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter), \
+                 patch("video_tool.pipeline.download") as download_media, \
+                 patch("video_tool.pipeline.Transcriber") as transcriber, \
+                 self.assertLogs("video_tool.pipeline", level="INFO") as logs:
+                collect_or_run(config, [previous.url], True)
+            download_media.assert_not_called()
+            transcriber.assert_not_called()
+            self.assertIn("媒体文件不存在，跳过下载和转写", "\n".join(logs.output))
+
+    def test_force_reprocess_downloads_and_transcribes_completed_video(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = load_config(DEFAULT_FILE)
+            config["runtime"]["state_db"] = root / "state.sqlite3"
+            config["report"]["output_dir"] = root / "reports"
+            config["download"]["output_dir"] = root / "downloads"
+            config["asr"]["api_key"] = "test"
+            config["crawl"]["refresh_completed"] = True
+            previous = Video("douyin", "123", "https://www.douyin.com/video/123", "标题",
+                             metadata_status="complete", comments_complete=True,
+                             transcript_status="complete")
+            store = Store(config["runtime"]["state_db"])
+            store.save_video(previous)
+            store.close()
+            media = root / "downloads" / "标题_123.mp4"
+            media.parent.mkdir()
+            media.write_bytes(b"media")
+            adapter = Mock()
+            adapter.read_video.return_value = Video(
+                "douyin", "123", previous.url, "标题", metadata_status="complete",
+                media_urls=["https://media.example/video.mp4"])
+            adapter.read_comments.return_value = CommentResult([], True, "到底")
+            with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter), \
+                 patch("video_tool.pipeline.download", return_value=DownloadResult(media, "video/mp4")) as download_media, \
+                 patch("video_tool.pipeline.Transcriber") as transcriber, \
+                 self.assertLogs("video_tool.pipeline", level="INFO") as logs:
+                transcriber.return_value.transcribe.return_value = ("重新转写", [
+                    SegmentResult(0, 0, 1, "complete", "重新转写")])
+                collect_or_run(config, [previous.url], True)
+            download_media.assert_called_once()
+            transcriber.return_value.transcribe.assert_called_once()
+            self.assertIn("强制重跑视频 123", "\n".join(logs.output))
+
+    def test_run_generates_reports_only_for_current_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = load_config(DEFAULT_FILE)
+            config["runtime"]["state_db"] = root / "state.sqlite3"
+            config["report"]["output_dir"] = root / "reports"
+            store = Store(root / "state.sqlite3")
+            older = Video("douyin", "111", "https://www.douyin.com/video/111", "旧视频",
+                          metadata_status="complete", comments_complete=True,
+                          transcript_status="complete")
+            current = Video("douyin", "222", "https://www.douyin.com/video/222", "当前视频",
+                            metadata_status="complete", comments_complete=True,
+                            transcript_status="complete")
+            store.save_video(older)
+            store.save_video(current)
+            store.close()
+            report_dir = root / "reports"
+            report_dir.mkdir()
+            old_report = report_dir / f"{video_stem(older)}.md"
+            old_report.write_text("保留的旧报告", encoding="utf-8")
+            adapter = Mock()
+            with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter):
+                paths = collect_or_run(config, [current.url], True)
+            self.assertEqual([path.name for path in paths], [f"{video_stem(current)}.md"])
+            self.assertEqual(old_report.read_text(encoding="utf-8"), "保留的旧报告")
+            adapter.read_video.assert_not_called()
 
     def test_missing_ffmpeg_is_logged_before_download(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -26,14 +26,19 @@ def comment_char_count(text: str) -> int:
     return sum(not character.isspace() for character in text or "")
 
 
-def generate(store: Store, config: dict) -> list[Path]:
+def generate(store: Store, config: dict, *, video_ids: set[str] | None = None,
+             collection_ids: set[str] | None = None,
+             profile_urls: set[str] | None = None) -> list[Path]:
     output = Path(config["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
     paths = []
-    videos = store.all_videos()
+    all_videos = store.all_videos()
+    videos = [video for video in all_videos if video_ids is None or video.video_id in video_ids]
     for video in videos:
         path = output / f"{video_stem(video)}.md"
         discoveries = store.discoveries(video.platform, video.author_id) if video.author_id else []
+        if profile_urls is not None:
+            discoveries = [item for item in discoveries if item["profile_url"] in profile_urls]
         author_name = video.author_name or next(
             (row["author_name"] for row in discoveries if row["author_name"]), "未知博主")
         lines = [f"# {escape(video.title or '标题未读取')} · {escape(video.video_id)}", "",
@@ -114,6 +119,8 @@ def generate(store: Store, config: dict) -> list[Path]:
                 outdated.unlink()
     represented = {(video.platform, video.author_id) for video in videos if video.author_id}
     for discovery in store.all_discoveries():
+        if profile_urls is not None and discovery["profile_url"] not in profile_urls:
+            continue
         key = (discovery["platform"], discovery["author_id"])
         if key in represented:
             continue
@@ -124,9 +131,11 @@ def generate(store: Store, config: dict) -> list[Path]:
                         f"覆盖：{'确认完整' if discovery['complete'] else '未确认完整'}；"
                         f"原因：{escape(discovery['stop_reason'])}\n", encoding="utf-8")
         paths.append(path)
-    by_id = {(video.platform, video.video_id): video for video in videos}
+    by_id = {(video.platform, video.video_id): video for video in all_videos}
     generated_names = {path.name for path in paths}
     for collection in store.all_collections():
+        if collection_ids is not None and collection.collection_id not in collection_ids:
+            continue
         path = output / f"douyin_collection_{safe_filename(collection.collection_id)}.md"
         lines = [f"# 合集 · {escape(collection.name or collection.collection_id)}", "",
                  f"合集链接：{collection.url}", "",
