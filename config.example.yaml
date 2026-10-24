@@ -137,6 +137,8 @@ report:
   write_partial_results: true  # --report-write-partial-results / --no-report-write-partial-results
 
 runtime:
+  # 所有相对数据路径的根目录；修改后 work、outputs、浏览器会话等目录都会随之切换。
+  data_dir: "."  # --runtime-data-dir PATH
   # 保存采集状态、评论和转写结果，用于中断后续跑。
   state_db: "work/state.sqlite3"  # --runtime-state-db PATH
 

@@ -25,6 +25,11 @@ class Store:
                 transcript_status TEXT NOT NULL DEFAULT 'pending',
                 transcript TEXT NOT NULL DEFAULT '', transcript_error TEXT NOT NULL DEFAULT '',
                 content_type TEXT NOT NULL DEFAULT 'video', image_urls TEXT NOT NULL DEFAULT '[]',
+                description TEXT NOT NULL DEFAULT '', published_at TEXT NOT NULL DEFAULT '',
+                likes INTEGER NOT NULL DEFAULT 0, favorites INTEGER NOT NULL DEFAULT 0,
+                shares INTEGER NOT NULL DEFAULT 0, cover_url TEXT NOT NULL DEFAULT '',
+                duration_seconds REAL NOT NULL DEFAULT 0, local_media_path TEXT NOT NULL DEFAULT '',
+                collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (platform, video_id)
             );
@@ -32,6 +37,7 @@ class Store:
                 platform TEXT NOT NULL, video_id TEXT NOT NULL, comment_id TEXT NOT NULL,
                 text TEXT NOT NULL, likes INTEGER NOT NULL DEFAULT 0, author TEXT NOT NULL DEFAULT '',
                 parent_id TEXT NOT NULL DEFAULT '', reply_to_id TEXT NOT NULL DEFAULT '',
+                author_id TEXT NOT NULL DEFAULT '', published_at TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (platform, video_id, comment_id)
             );
             CREATE TABLE IF NOT EXISTS segments (
@@ -55,6 +61,10 @@ class Store:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (platform, collection_id)
             );
+            CREATE TABLE IF NOT EXISTS api_tasks (
+                task_id TEXT PRIMARY KEY, payload TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(discoveries)")}
         if "video_urls" not in columns:
@@ -66,11 +76,29 @@ class Store:
             self.db.execute("ALTER TABLE videos ADD COLUMN image_urls TEXT NOT NULL DEFAULT '[]'")
         if "comments_version" not in video_columns:
             self.db.execute("ALTER TABLE videos ADD COLUMN comments_version INTEGER NOT NULL DEFAULT 1")
+        video_additions = {
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "published_at": "TEXT NOT NULL DEFAULT ''",
+            "likes": "INTEGER NOT NULL DEFAULT 0",
+            "favorites": "INTEGER NOT NULL DEFAULT 0",
+            "shares": "INTEGER NOT NULL DEFAULT 0",
+            "cover_url": "TEXT NOT NULL DEFAULT ''",
+            "duration_seconds": "REAL NOT NULL DEFAULT 0",
+            "local_media_path": "TEXT NOT NULL DEFAULT ''",
+            "collected_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in video_additions.items():
+            if name not in video_columns:
+                self.db.execute(f"ALTER TABLE videos ADD COLUMN {name} {definition}")
         comment_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(comments)")}
         if "parent_id" not in comment_columns:
             self.db.execute("ALTER TABLE comments ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''")
         if "reply_to_id" not in comment_columns:
             self.db.execute("ALTER TABLE comments ADD COLUMN reply_to_id TEXT NOT NULL DEFAULT ''")
+        if "author_id" not in comment_columns:
+            self.db.execute("ALTER TABLE comments ADD COLUMN author_id TEXT NOT NULL DEFAULT ''")
+        if "published_at" not in comment_columns:
+            self.db.execute("ALTER TABLE comments ADD COLUMN published_at TEXT NOT NULL DEFAULT ''")
         collection_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(collections)")}
         if "video_titles" not in collection_columns:
             self.db.execute("ALTER TABLE collections ADD COLUMN video_titles TEXT NOT NULL DEFAULT '{}'")
@@ -86,7 +114,6 @@ class Store:
     @staticmethod
     def _video(row) -> Video:
         data = dict(row)
-        data.pop("updated_at", None)
         data["hashtags"] = json.loads(data["hashtags"])
         data["image_urls"] = json.loads(data["image_urls"])
         data["comments_complete"] = bool(data["comments_complete"])
@@ -96,8 +123,8 @@ class Store:
         self.db.execute("""
             INSERT INTO videos (platform,video_id,url,title,author_id,author_name,hashtags,tags_status,
               metadata_status,metadata_error,comments_complete,comments_stop_reason,comments_version,transcript_status,transcript,transcript_error,
-              content_type,image_urls)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              content_type,image_urls,description,published_at,likes,favorites,shares,cover_url,duration_seconds,local_media_path)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(platform,video_id) DO UPDATE SET
               url=excluded.url,title=excluded.title,author_id=excluded.author_id,author_name=excluded.author_name,
               hashtags=excluded.hashtags,tags_status=excluded.tags_status,metadata_status=excluded.metadata_status,
@@ -105,12 +132,18 @@ class Store:
               comments_stop_reason=excluded.comments_stop_reason,comments_version=excluded.comments_version,
               transcript_status=excluded.transcript_status,
               transcript=excluded.transcript,transcript_error=excluded.transcript_error,
-              content_type=excluded.content_type,image_urls=excluded.image_urls,updated_at=CURRENT_TIMESTAMP
+              content_type=excluded.content_type,image_urls=excluded.image_urls,
+              description=excluded.description,published_at=excluded.published_at,
+              likes=excluded.likes,favorites=excluded.favorites,shares=excluded.shares,
+              cover_url=excluded.cover_url,duration_seconds=excluded.duration_seconds,
+              local_media_path=excluded.local_media_path,updated_at=CURRENT_TIMESTAMP
         """, (video.platform, video.video_id, video.url, video.title, video.author_id, video.author_name,
               json.dumps(video.hashtags, ensure_ascii=False), video.tags_status, video.metadata_status,
               video.metadata_error, int(video.comments_complete), video.comments_stop_reason, video.comments_version,
               video.transcript_status, video.transcript, video.transcript_error,
-              video.content_type, json.dumps(video.image_urls, ensure_ascii=False)))
+              video.content_type, json.dumps(video.image_urls, ensure_ascii=False),
+              video.description, video.published_at, video.likes, video.favorites, video.shares,
+              video.cover_url, video.duration_seconds, video.local_media_path))
         self.db.commit()
 
     def save_comments(self, platform: str, video_id: str, result: CommentResult, replace: bool = False):
@@ -119,13 +152,15 @@ class Store:
                 self.db.execute("DELETE FROM comments WHERE platform=? AND video_id=?", (platform, video_id))
             for comment in result.comments:
                 self.db.execute("""INSERT INTO comments
-                    (platform,video_id,comment_id,text,likes,author,parent_id,reply_to_id)
-                    VALUES (?,?,?,?,?,?,?,?)
+                    (platform,video_id,comment_id,text,likes,author,parent_id,reply_to_id,author_id,published_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(platform,video_id,comment_id) DO UPDATE SET
                     text=excluded.text,likes=excluded.likes,author=excluded.author,
-                    parent_id=excluded.parent_id,reply_to_id=excluded.reply_to_id""",
+                    parent_id=excluded.parent_id,reply_to_id=excluded.reply_to_id,
+                    author_id=excluded.author_id,published_at=excluded.published_at""",
                     (platform, video_id, comment.comment_id, comment.text, comment.likes,
-                     comment.author, comment.parent_id, comment.reply_to_id))
+                     comment.author, comment.parent_id, comment.reply_to_id,
+                     comment.author_id, comment.published_at))
             self.db.execute("UPDATE videos SET comments_complete=?,comments_stop_reason=?,comments_version=2 WHERE platform=? AND video_id=?",
                             (int(result.complete), result.stop_reason, platform, video_id))
 
@@ -166,7 +201,8 @@ class Store:
         rows = self.db.execute("SELECT * FROM comments WHERE platform=? AND video_id=? ORDER BY likes DESC, comment_id",
                                (platform, video_id)).fetchall()
         return [Comment(row["comment_id"], row["text"], row["likes"], row["author"],
-                        row["parent_id"], row["reply_to_id"]) for row in rows]
+                        row["parent_id"], row["reply_to_id"], row["author_id"], row["published_at"])
+                for row in rows]
 
     def discoveries(self, platform: str, author_id: str) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM discoveries WHERE platform=? AND author_id=? ORDER BY profile_url",
@@ -200,3 +236,24 @@ class Store:
                            json.loads(row["video_urls"]), bool(row["complete"]), row["stop_reason"],
                            json.loads(row["video_titles"]))
                 for row in self.db.execute("SELECT * FROM collections ORDER BY platform,collection_id")]
+
+    def save_task(self, task: dict):
+        payload = json.dumps(task, ensure_ascii=False)
+        self.db.execute("""INSERT INTO api_tasks (task_id,payload,created_at)
+            VALUES (?,?,?) ON CONFLICT(task_id) DO UPDATE SET
+            payload=excluded.payload,updated_at=CURRENT_TIMESTAMP""",
+            (task["id"], payload, task["created_at"]))
+        self.db.commit()
+
+    def get_task(self, task_id: str) -> dict | None:
+        row = self.db.execute("SELECT payload FROM api_tasks WHERE task_id=?", (task_id,)).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def all_tasks(self) -> list[dict]:
+        rows = self.db.execute("SELECT payload FROM api_tasks ORDER BY created_at DESC").fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def delete_task(self, task_id: str) -> bool:
+        cursor = self.db.execute("DELETE FROM api_tasks WHERE task_id=?", (task_id,))
+        self.db.commit()
+        return cursor.rowcount > 0

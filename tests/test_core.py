@@ -495,6 +495,26 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(post.media_urls, [url_a, url_b])
         self.assertEqual(post.title, "标题")
 
+    def test_video_metadata_includes_engagement_and_publication_fields(self):
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter._navigate = lambda _: "https://www.douyin.com/video/123"
+        adapter.responses = [("https://www.douyin.com/aweme/detail", {"aweme_detail": {
+            "aweme_id": "123", "desc": "第一行标题\n完整视频简介 #AI", "create_time": 1700000000,
+            "author": {"sec_uid": "author-1", "nickname": "测试作者"},
+            "statistics": {"digg_count": 1200, "collect_count": 34, "share_count": 56},
+            "video": {"duration": 12500, "cover": {"url_list": ["https://cdn.example/cover.jpg"]},
+                      "play_addr": {"url_list": ["https://cdn.example/video.mp4"]}},
+        }})]
+        adapter._hydration = lambda: []
+        adapter.page = Mock()
+        post = adapter.read_video("https://www.douyin.com/video/123")
+        self.assertEqual(post.title, "第一行标题")
+        self.assertIn("完整视频简介", post.description)
+        self.assertEqual((post.likes, post.favorites, post.shares), (1200, 34, 56))
+        self.assertEqual(post.duration_seconds, 12.5)
+        self.assertEqual(post.cover_url, "https://cdn.example/cover.jpg")
+        self.assertTrue(post.published_at.startswith("2023-"))
+
     def test_video_player_source_does_not_need_video_id_in_url(self):
         adapter = DouyinAdapter.__new__(DouyinAdapter)
         adapter._navigate = lambda _: "https://www.douyin.com/video/123"

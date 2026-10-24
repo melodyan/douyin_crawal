@@ -12,6 +12,8 @@ class Comment:
     author: str = ""
     parent_id: str = ""
     reply_to_id: str = ""
+    author_id: str = ""
+    published_at: str = ""
 
 
 @dataclass
@@ -35,6 +37,16 @@ class Video:
     transcript_error: str = ""
     content_type: str = "video"  # video or image
     image_urls: list[list[str]] = field(default_factory=list)
+    description: str = ""
+    published_at: str = ""
+    likes: int = 0
+    favorites: int = 0
+    shares: int = 0
+    cover_url: str = ""
+    duration_seconds: float = 0
+    local_media_path: str = ""
+    collected_at: str = ""
+    updated_at: str = ""
 
 
 @dataclass

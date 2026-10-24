@@ -22,7 +22,7 @@ def default_config_path(project_dir: Path) -> Path:
 PATH_KEYS = {
     "inputs.urls_file", "browser.profile_dir", "audio.ffmpeg_path",
     "download.output_dir", "asr.output_dir", "report.output_dir",
-    "runtime.state_db", "runtime.log_file",
+    "runtime.data_dir", "runtime.state_db", "runtime.log_file",
 }
 INT_MIN = {
     "inputs.max_videos_per_profile": 1, "browser.navigation_timeout_seconds": 1,
@@ -109,12 +109,14 @@ def parser_for(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path)
     _add_options(parser, defaults)
     commands = parser.add_subparsers(dest="command")
-    for command in ("run", "collect", "download", "transcribe", "report"):
+    for command in ("run", "collect", "download", "transcribe", "report", "migrate-data"):
         sub = commands.add_parser(command)
         sub.add_argument("--config", type=Path, default=argparse.SUPPRESS)
         _add_options(sub, defaults)
         if command == "transcribe":
             sub.add_argument("--input", type=Path, required=True)
+        if command == "migrate-data":
+            sub.add_argument("--target", type=Path, required=True)
     return parser
 
 
@@ -149,11 +151,14 @@ def load_config(path: Path, overrides: argparse.Namespace | None = None) -> dict
             dest = name.replace(".", "_")
             if dest in values:
                 _set(config, name, values[dest])
+    data_dir = Path(config["runtime"]["data_dir"])
+    data_dir = data_dir if data_dir.is_absolute() else (path.parent / data_dir).resolve()
+    config["runtime"]["data_dir"] = data_dir
     for name in PATH_KEYS:
         value = _get(config, name)
         if value is not None and (name != "audio.ffmpeg_path" or any(c in str(value) for c in ("/", "\\"))):
             candidate = Path(value)
-            _set(config, name, candidate if candidate.is_absolute() else (path.parent / candidate).resolve())
+            _set(config, name, candidate if candidate.is_absolute() else (data_dir / candidate).resolve())
     return config
 
 

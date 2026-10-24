@@ -2,9 +2,9 @@
 
 从抖音作品、博主主页或合集链接采集公开作品信息和评论；下载视频或图文，并将视频转写为文本报告。
 
-## 前端工作台（预览）
+## 前端工作台
 
-Vue 页面目前独立于 Python 程序运行，使用模拟任务数据，不会发起真实采集。启动方式见 [`frontend/README.md`](frontend/README.md)。
+Vue 前端运行于 Vite，后端由 FastAPI 提供 HTTP 接口。两者需要分别启动；前端依赖通过 `frontend/package.json` 和 `npm install` 安装，Python 后端依赖通过本文件和 `requirements.txt` 安装。
 
 ## 功能概览
 
@@ -17,13 +17,22 @@ Vue 页面目前独立于 Python 程序运行，使用模拟任务数据，不�
 
 ## 安装
 
-要求 Python 3.11 或更高版本。建议在项目目录中创建虚拟环境：
+项目要求 Python 3.11 或更高版本；当前已验证的版本为 **Python 3.12.15**，推荐使用 Python 3.12。PyCharm 解释器和运行配置应使用同一个 Python 环境。
+
+在 PyCharm Terminal 的项目根目录安装后端依赖和 Playwright 浏览器：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 playwright install chromium
+```
+
+安装前端依赖（Node.js 20 或更高版本）：
+
+```powershell
+cd frontend
+npm install
 ```
 
 视频转写还需要：
@@ -120,6 +129,49 @@ python main.py run --url "分享文案 1" --url "分享文案 2"
 ```
 
 ## 命令说明
+
+### `migrate-data`：迁移数据目录
+
+将状态库、日志、浏览器会话、下载文件、转写文件和报告复制到新目录，并把 `config.yaml` 的 `runtime.data_dir` 更新为新位置。之后程序会自动从新目录读取和写入数据：
+
+```powershell
+python main.py migrate-data --target "D:\\douyin-data"
+```
+
+如果当前只有 `config.yaml.bak`，命令会生成本地的 `config.yaml`，不会修改示例配置。
+
+### HTTP API（前端工作台）
+
+安装依赖后可启动 API：
+
+```powershell
+uvicorn api:app --reload
+```
+
+默认地址为 `http://127.0.0.1:8000`。接口提供持久化任务的创建、查询、重试、取消和删除，任务事件 SSE，视频、评论、转写分段、主页、合集、报告以及配置读写。任务执行复用现有 Python 流程和 SQLite 状态库；服务重启后历史任务不会丢失，运行中的旧任务会标记为中断并可重试。
+
+取消采用安全检查点：发现列表、评论分页、作品切换和转写分段之间会响应取消。若正处于一次页面加载或网络请求中，会在该调用返回后停止，已经完成的数据仍保存在状态库中。
+
+### 在 PyCharm 中启动前端
+
+前端依赖安装完成后，在 PyCharm 中打开 `Run → Edit Configurations`，点击左上角 `+` 并选择 `npm`，设置：
+
+| 配置项 | 值 |
+| --- | --- |
+| Name | `Frontend` |
+| package.json | `<项目目录>\\frontend\\package.json`，例如 `E:\\code\\douyin_crawal\\frontend\\package.json` |
+| Command | `run` |
+| Scripts | `dev` |
+| Arguments | 留空 |
+| Node runtime / Package manager | 选择本机已安装的 Node.js / npm |
+
+点击 `Apply`、`OK` 后运行 `Frontend` 配置。Vite 默认地址是 `http://localhost:5173`。若 Scripts 列表为空，先在 Terminal 执行 `cd frontend` 和 `npm install`，再重新打开配置。
+
+前端调用 `http://127.0.0.1:8000` 的后端 API。请另开一个 PyCharm Terminal，或运行 `Backend API` 配置启动后端；调试时使用不带 `--reload` 的参数：
+
+```text
+api:app --host 127.0.0.1 --port 8000
+```
 
 ### `run`：完整流程
 

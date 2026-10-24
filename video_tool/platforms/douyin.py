@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -16,6 +17,18 @@ LOG = logging.getLogger(__name__)
 VIDEO_RE = re.compile(r"/(?:video|note)/(\d+)")
 COLLECTION_RE = re.compile(r"/(?:collection|mix)/(\d+)(?:/|$)")
 HASHTAG_RE = re.compile(r"(?<!\w)#([^\s#]+)")
+
+
+def _first_line(value: str, limit: int = 80) -> str:
+    return next((line.strip()[:limit] for line in value.splitlines() if line.strip()), "")
+
+
+def _first_url(value) -> str:
+    if isinstance(value, str):
+        return value if value.startswith("https://") else ""
+    if isinstance(value, list):
+        return next((item for item in value if isinstance(item, str) and item.startswith("https://")), "")
+    return ""
 
 
 def video_id(url: str) -> str:
@@ -461,15 +474,34 @@ class DouyinAdapter:
         video = Video("douyin", identifier, f"https://www.douyin.com/{kind}/{identifier}")
         video.content_type = "image" if kind == "note" else "video"
         if match:
-            video.title = next((str(item["desc"]).strip() for item in matches if item.get("desc")), "")
+            video.description = next((str(item["desc"]).strip() for item in matches if item.get("desc")), "")
+            video.title = _first_line(video.description)
             author = next((item["author"] for item in matches
                            if isinstance(item.get("author"), dict) and item["author"]), {})
             video.author_id = str(author.get("sec_uid") or author.get("uid") or "")
             video.author_name = str(author.get("nickname") or "")
-            video.hashtags = list(dict.fromkeys(HASHTAG_RE.findall(video.title)))
+            statistics = match.get("statistics") if isinstance(match.get("statistics"), dict) else {}
+            video.likes = likes_count(statistics.get("digg_count"))
+            video.favorites = likes_count(statistics.get("collect_count"))
+            video.shares = likes_count(statistics.get("share_count"))
+            created = match.get("create_time")
+            if isinstance(created, (int, float)) and created > 0:
+                video.published_at = datetime.fromtimestamp(created, timezone.utc).isoformat()
+            media = match.get("video") if isinstance(match.get("video"), dict) else {}
+            duration = media.get("duration") or match.get("duration") or 0
+            try:
+                video.duration_seconds = round(float(duration) / 1000, 3) if float(duration) > 1000 else float(duration)
+            except (TypeError, ValueError):
+                video.duration_seconds = 0
+            cover = (media.get("cover") or media.get("origin_cover") or media.get("dynamic_cover") or {})
+            if isinstance(cover, dict):
+                video.cover_url = _first_url(cover.get("url_list"))
+            video.hashtags = list(dict.fromkeys(HASHTAG_RE.findall(video.description)))
             video.tags_status = "present" if video.hashtags else "absent"
             if video.content_type == "image":
                 video.image_urls = _image_sources(match)
+                if not video.cover_url and video.image_urls:
+                    video.cover_url = video.image_urls[0][0]
             else:
                 for item in matches:
                     video.media_urls.extend(_video_sources(item))
@@ -479,7 +511,8 @@ class DouyinAdapter:
                     locator = self.page.locator(selector).first
                     text = locator.get_attribute("content") if selector.startswith("meta") else locator.inner_text(timeout=1500)
                     if text and text.strip():
-                        video.title = text.strip()
+                        video.description = text.strip()
+                        video.title = _first_line(video.description)
                         break
                 except Exception:
                     pass
@@ -487,12 +520,13 @@ class DouyinAdapter:
             try:
                 title = self.page.title().strip()
                 if title.endswith(" - 抖音"):
-                    video.title = title[:-5].strip()
+                    video.description = title[:-5].strip()
+                    video.title = _first_line(video.description)
             except Exception:
                 pass
         if not match:
             if video.title:
-                video.hashtags = list(dict.fromkeys(HASHTAG_RE.findall(video.title)))
+                video.hashtags = list(dict.fromkeys(HASHTAG_RE.findall(video.description or video.title)))
                 video.tags_status = "present" if video.hashtags else "absent"
             try:
                 tags = self.page.locator('a[href*="/search/%23"], a[href*="hashtag"]')
@@ -612,10 +646,16 @@ class DouyinAdapter:
                     cid = str(item.get("cid") or "")
                     if cid:
                         parent_id, reply_to_id = _comment_parent(item, response_url)
+                        comment_author = item.get("user") if isinstance(item.get("user"), dict) else {}
+                        comment_time = item.get("create_time")
+                        published_at = (datetime.fromtimestamp(comment_time, timezone.utc).isoformat()
+                                        if isinstance(comment_time, (int, float)) and comment_time > 0 else "")
                         comments[cid] = Comment(cid, str(item.get("text") or ""),
                                                 likes_count(item.get("digg_count")),
-                                                str(_nested(item, "user", "nickname") or ""),
-                                                parent_id, reply_to_id)
+                                                str(comment_author.get("nickname") or ""),
+                                                parent_id, reply_to_id,
+                                                str(comment_author.get("sec_uid") or comment_author.get("uid") or ""),
+                                                published_at)
                         batch[cid] = comments[cid]
                         if not parent_id:
                             expected_replies[cid] = max(expected_replies.get(cid, 0),

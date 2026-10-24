@@ -8,6 +8,7 @@ import yaml
 
 from video_tool.config import DEFAULT_FILE, default_config_path, input_urls, load_config, parser_for, validate
 from video_tool.pipeline import collect_or_run, download_one, report_only, transcribe_one
+from video_tool.migration import migrate_data
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -21,6 +22,10 @@ def main(argv: list[str] | None = None) -> int:
     config_path = args.config or default_config_path(project_dir)
     try:
         config = load_config(config_path, args)
+        if command == "migrate-data":
+            target = args.target if args.target.is_absolute() else (config_path.parent / args.target)
+            print(migrate_data(config, target, config_path))
+            return 0
         urls = input_urls(config) if command in {"run", "collect", "download"} else []
         validate(config, command, urls)
         log_path = Path(config["runtime"]["log_file"])

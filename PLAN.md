@@ -59,3 +59,150 @@
 - 抖音开放平台的完整账号及评论数据能力有授权前提；任意公开博主的全部视频或全部评论无法保证从公开页面取得。参考：[抖音开放平台用户数据能力](https://developer.open-douyin.com/docs/resource/zh-CN/mini-app/open-capacity/basic-capacities/douyin)、[抖音用户服务协议](https://www.douyin.com/agreements/?id=6773906068725565448&ug_source=sem_baidu)。
 - MiMo ASR 当前接收 MP3/WAV，Base64 编码音频大小上限为 10 MB；按官方接口调用并对长视频分段。参考：[小米 MiMo 语音识别文档](https://mimo.mi.com/docs/zh-CN/quick-start/usage-guide/audio/Speech-Recognition)。
 - 本目录已有首版代码、依赖声明和离线测试；公开页面的端到端采集效果仍需按实际链接与登录状态验证。图文图片下载不在当前版本范围内。
+
+## 7. SQLite 数据库设计
+
+默认状态库路径为 `work/state.sqlite3`，由 `video_tool.storage.Store` 创建和维护。SQLite 开启 WAL 模式；每个处理步骤完成后立即提交，支持中断续跑。
+
+### 7.1 表结构
+
+```sql
+CREATE TABLE videos (
+    platform TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    author_id TEXT NOT NULL DEFAULT '',
+    author_name TEXT NOT NULL DEFAULT '',
+    hashtags TEXT NOT NULL DEFAULT '[]',
+    tags_status TEXT NOT NULL DEFAULT 'unread',
+    metadata_status TEXT NOT NULL DEFAULT 'pending',
+    metadata_error TEXT NOT NULL DEFAULT '',
+    comments_complete INTEGER NOT NULL DEFAULT 0,
+    comments_stop_reason TEXT NOT NULL DEFAULT '未采集',
+    comments_version INTEGER NOT NULL DEFAULT 2,
+    transcript_status TEXT NOT NULL DEFAULT 'pending',
+    transcript TEXT NOT NULL DEFAULT '',
+    transcript_error TEXT NOT NULL DEFAULT '',
+    content_type TEXT NOT NULL DEFAULT 'video',
+    image_urls TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (platform, video_id)
+);
+
+CREATE TABLE comments (
+    platform TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    comment_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    likes INTEGER NOT NULL DEFAULT 0,
+    author TEXT NOT NULL DEFAULT '',
+    parent_id TEXT NOT NULL DEFAULT '',
+    reply_to_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (platform, video_id, comment_id)
+);
+
+CREATE TABLE segments (
+    platform TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    segment_index INTEGER NOT NULL,
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL,
+    status TEXT NOT NULL,
+    text TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (platform, video_id, segment_index)
+);
+
+CREATE TABLE discoveries (
+    platform TEXT NOT NULL,
+    profile_url TEXT NOT NULL,
+    author_id TEXT NOT NULL DEFAULT '',
+    author_name TEXT NOT NULL DEFAULT '',
+    complete INTEGER NOT NULL,
+    stop_reason TEXT NOT NULL,
+    video_count INTEGER NOT NULL,
+    video_urls TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (platform, profile_url)
+);
+
+CREATE TABLE collections (
+    platform TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    complete INTEGER NOT NULL DEFAULT 0,
+    stop_reason TEXT NOT NULL DEFAULT '未采集',
+    video_urls TEXT NOT NULL DEFAULT '[]',
+    video_titles TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (platform, collection_id)
+);
+```
+
+`comments`、`segments` 通过 `(platform, video_id)` 与 `videos` 逻辑关联，当前未启用 SQLite 外键。`hashtags`、`image_urls`、`video_urls` 和 `video_titles` 使用 JSON 文本保存。`Video.media_urls` 仅用于运行期间解析媒体地址，当前不写入状态库。
+
+### 7.2 表用途与状态字段
+
+| 表 | 用途 | 关键状态 |
+| --- | --- | --- |
+| `videos` | 作品元数据、标签、评论采集状态、转写结果 | `metadata_status`、`comments_complete`、`transcript_status` |
+| `comments` | 一级评论及评论回复 | `parent_id`、`reply_to_id`、`likes` |
+| `segments` | MiMo 音频分段及每段转写结果 | `status`、`error` |
+| `discoveries` | 作者主页发现结果及续跑检查点 | `complete`、`stop_reason` |
+| `collections` | 合集发现结果、顺序和标题 | `complete`、`stop_reason` |
+
+## 8. 前后端接口契约
+
+当前版本的 Python 程序是 CLI，Vue 前端仍使用模拟数据，尚未提供 HTTP 服务。以下接口作为前后端接入时的统一契约，后端可用 FastAPI 或 Flask 实现，接口内部复用现有 `pipeline.py` 和 `Store`，不直接让前端访问 SQLite。
+
+### 8.1 任务接口
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `POST` | `/api/tasks` | 创建采集、下载、转写或报告任务 |
+| `GET` | `/api/tasks` | 查询任务列表，支持状态、作者、标题和时间筛选 |
+| `GET` | `/api/tasks/{task_id}` | 查询单个任务及各步骤状态 |
+| `POST` | `/api/tasks/{task_id}/retry` | 重试失败任务或强制重跑 |
+| `POST` | `/api/tasks/{task_id}/cancel` | 请求停止尚未完成的任务 |
+
+创建任务请求示例：
+
+```json
+{
+  "mode": "run",
+  "urls": ["https://v.douyin.com/example/"],
+  "options": {
+    "force_reprocess": false,
+    "max_comments_per_video": null,
+    "max_videos_per_profile": null
+  }
+}
+```
+
+任务响应统一包含：`id`、`mode`、`state`、`progress`、`created_at`、`started_at`、`finished_at`、`error`、`steps`。`steps` 至少包含 `collect`、`download`、`transcribe`、`report` 四个步骤，每步状态为 `pending`、`running`、`done` 或 `failed`。
+
+### 8.2 数据查询接口
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/videos` | 分页查询作品；支持 `platform`、`author_id`、`transcript_status`、`content_type` |
+| `GET` | `/api/videos/{platform}/{video_id}` | 查询作品详情 |
+| `GET` | `/api/videos/{platform}/{video_id}/comments` | 查询评论和回复，支持 `limit`、`offset`、`sort=likes` |
+| `GET` | `/api/videos/{platform}/{video_id}/segments` | 查询转写分段 |
+| `GET` | `/api/discoveries` | 查询作者主页发现记录 |
+| `GET` | `/api/collections` | 查询合集记录 |
+| `GET` | `/api/reports` | 查询已生成报告 |
+| `GET` | `/api/reports/{report_id}/download` | 下载 Markdown 报告 |
+
+### 8.3 配置与运行接口
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/config` | 获取前端可编辑配置；密钥字段只返回是否已设置 |
+| `PUT` | `/api/config` | 保存配置到本机配置文件 |
+| `GET` | `/api/health` | 检查 API、SQLite、FFmpeg 和浏览器环境 |
+| `GET` | `/api/events` | 通过 SSE 推送任务进度和日志；也可改为 WebSocket |
+
+接口约定：成功响应使用 `{ "data": ... }`，失败响应使用 `{ "error": { "code": "...", "message": "..." } }`；分页响应使用 `items`、`page`、`page_size`、`total`。前端只依赖接口返回的标准化字段，不读取 SQLite 文件，也不解析运行日志。

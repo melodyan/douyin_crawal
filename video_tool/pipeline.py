@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 from .downloader import download, download_images
@@ -16,6 +17,15 @@ from .transcriber import Transcriber
 LOG = logging.getLogger(__name__)
 
 
+class TaskCancelled(RuntimeError):
+    """Raised at a safe checkpoint when an API task requests cancellation."""
+
+
+def _checkpoint(cancel_requested: Callable[[], bool] | None):
+    if cancel_requested and cancel_requested():
+        raise TaskCancelled("任务已取消")
+
+
 def _preserve(new: Video, old: Video | None):
     if old:
         new.comments_complete = old.comments_complete
@@ -24,6 +34,7 @@ def _preserve(new: Video, old: Video | None):
         new.transcript_status = old.transcript_status
         new.transcript = old.transcript
         new.transcript_error = old.transcript_error
+        new.local_media_path = old.local_media_path
 
 
 def _media_done(video: Video) -> bool:
@@ -43,14 +54,28 @@ def _log_skipped_media(video: Video, config: dict):
         LOG.info("视频 %s 已下载并转写完成，临时媒体已按配置删除，跳过下载和转写", video.video_id)
 
 
-def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict, full: bool) -> bool:
+def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict, full: bool,
+                   include_comments: bool = True,
+                   cancel_requested: Callable[[], bool] | None = None,
+                   on_progress: Callable[[str, int], None] | None = None,
+                   transcribe_media: bool = True,
+                   retain_download: bool = False) -> bool:
+    _checkpoint(cancel_requested)
     identifier = video_id(url)
     old = store.get_video("douyin", identifier) if identifier else None
     if old and config["crawl"]["refresh_completed"]:
         LOG.info("强制重跑视频 %s，忽略已完成状态", old.video_id)
     if old and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]:
-        media_done = _media_done(old)
-        if old.metadata_status == "complete" and old.comments_complete and old.comments_version >= 2 and (not full or media_done):
+        if old.content_type == "image":
+            media_path = Path(config["download"]["output_dir"]) / video_stem(old)
+            media_done = media_path.is_dir()
+        else:
+            media_path = Path(config["download"]["output_dir"]) / f"{video_stem(old)}.mp4"
+            media_done = (_media_done(old) and not retain_download) if transcribe_media else media_path.is_file()
+            if transcribe_media and retain_download:
+                media_done = _media_done(old) and media_path.is_file()
+        comments_done = not include_comments or (old.comments_complete and old.comments_version >= 2)
+        if old.metadata_status == "complete" and comments_done and (not full or media_done):
             if full and media_done:
                 _log_skipped_media(old, config)
             LOG.info("视频 %s 已完成全部处理，跳过", old.video_id)
@@ -64,16 +89,20 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
             failed.metadata_status, failed.metadata_error = "failed", str(exc)
             store.save_video(failed)
         return False
+    _checkpoint(cancel_requested)
+    if on_progress:
+        on_progress("collect", 25)
     if not config["crawl"]["refresh_completed"]:
         _preserve(video, old)
     store.save_video(video)
     comments_failed = False
-    if not (old and old.comments_complete and old.comments_version >= 2
+    if include_comments and not (old and old.comments_complete and old.comments_version >= 2
             and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]):
         try:
-            checkpoint = None
-            if not config["crawl"]["refresh_completed"]:
-                checkpoint = lambda partial: store.save_comments("douyin", video.video_id, partial)
+            def checkpoint(partial):
+                _checkpoint(cancel_requested)
+                if not config["crawl"]["refresh_completed"]:
+                    store.save_comments("douyin", video.video_id, partial)
             result = adapter.read_comments(video, config["crawl"]["max_comments_per_video"],
                                            on_progress=checkpoint,
                                            existing=store.comments("douyin", video.video_id)
@@ -81,6 +110,8 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
                                                and config["crawl"]["max_comments_per_video"] is None
                                                and not config["crawl"]["refresh_completed"])
                                            else None)
+        except TaskCancelled:
+            raise
         except Exception as exc:
             LOG.error("评论采集失败 %s: %s", video.video_id, exc)
             result = CommentResult([], False, str(exc))
@@ -89,6 +120,9 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         video.comments_complete = result.complete
         video.comments_stop_reason = result.stop_reason
         video.comments_version = 2
+    _checkpoint(cancel_requested)
+    if on_progress:
+        on_progress("comments" if include_comments else "collect", 45)
     media_done = bool(old and _media_done(old))
     if not full or (media_done and config["crawl"]["resume"] and not config["crawl"]["refresh_completed"]):
         if full and media_done:
@@ -96,8 +130,11 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         return video.metadata_status == "complete" and not comments_failed
     if video.content_type == "image":
         try:
+            if on_progress:
+                on_progress("download", 60)
             folder = Path(config["download"]["output_dir"]) / video_stem(video)
             download_images(video.image_urls, folder, config["audio"]["download_timeout_seconds"])
+            video.local_media_path = str(folder.resolve())
             video.transcript_status, video.transcript_error = "images_saved", ""
             LOG.info("图文 %s 已保存图片：%s", video.video_id, folder)
         except (OSError, RuntimeError) as exc:
@@ -111,6 +148,20 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         store.save_video(video)
         LOG.error("视频 %s 下载失败：%s", video.video_id, video.transcript_error)
         return False
+    if not transcribe_media:
+        media_path = Path(config["download"]["output_dir"]) / f"{video_stem(video)}.mp4"
+        _checkpoint(cancel_requested)
+        if on_progress:
+            on_progress("download", 60)
+        LOG.info("视频 %s 开始下载媒体", video.video_id)
+        result = download(video.media_urls, media_path, config["audio"]["download_timeout_seconds"])
+        if not result.path:
+            LOG.error("视频 %s 下载失败：%s", video.video_id, result.error)
+            return False
+        video.local_media_path = str(result.path.resolve())
+        store.save_video(video)
+        LOG.info("视频 %s 下载完成：%s", video.video_id, result.path)
+        return video.metadata_status == "complete" and not comments_failed
     if not config["asr"]["api_key"]:
         video.transcript_status, video.transcript_error = "failed", "MiMo API Key 为空；请设置 asr.api_key 或 --mimo-api-key"
         store.save_video(video)
@@ -125,6 +176,9 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         LOG.error("视频 %s 转写前检查失败：%s", video.video_id, exc)
         return False
     media_path = Path(config["download"]["output_dir"]) / f"{video_stem(video)}.mp4"
+    _checkpoint(cancel_requested)
+    if on_progress:
+        on_progress("download", 60)
     LOG.info("视频 %s 开始下载临时媒体", video.video_id)
     result = download(video.media_urls, media_path, config["audio"]["download_timeout_seconds"])
     if not result.path:
@@ -133,10 +187,14 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
         LOG.error("视频 %s 下载失败：%s", video.video_id, result.error)
         return False
     LOG.info("视频 %s 已下载临时媒体：%s", video.video_id, result.path)
+    video.local_media_path = str(result.path.resolve())
     try:
+        if on_progress:
+            on_progress("transcribe", 75)
         text, segments = transcriber.transcribe(
             result.path,
-            on_segment=lambda parts: store.save_segments("douyin", video.video_id, parts),
+            on_segment=lambda parts: (_checkpoint(cancel_requested),
+                                      store.save_segments("douyin", video.video_id, parts))[-1],
             existing=store.segments("douyin", video.video_id)
                      if config["crawl"]["resume"] and not config["crawl"]["refresh_completed"] else None)
         video.transcript = text
@@ -147,12 +205,15 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
             LOG.error("视频 %s 转写%s：%s", video.video_id, video.transcript_status, video.transcript_error)
         else:
             LOG.info("视频 %s 转写完成", video.video_id)
+    except TaskCancelled:
+        raise
     except Exception as exc:
         video.transcript_status, video.transcript_error = "failed", str(exc)
         LOG.error("视频 %s 转写失败：%s", video.video_id, exc)
     finally:
-        if not config["audio"]["keep_temporary_files"]:
+        if not (config["audio"]["keep_temporary_files"] or retain_download):
             result.path.unlink(missing_ok=True)
+            video.local_media_path = ""
             LOG.info("视频 %s 已删除临时媒体（audio.keep_temporary_files=false）", video.video_id)
         else:
             LOG.info("视频 %s 已保留媒体文件：%s", video.video_id, result.path)
@@ -160,7 +221,17 @@ def _process_video(adapter: DouyinAdapter, store: Store, url: str, config: dict,
     return video.transcript_status == "complete" and not comments_failed
 
 
-def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, int] | None = None) -> list[Path]:
+def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, int] | None = None,
+                   *, include_comments: bool = True,
+                   cancel_requested: Callable[[], bool] | None = None,
+                   on_progress: Callable[[str, int], None] | None = None,
+                   transcribe_media: bool | None = None,
+                   retain_download: bool = False,
+                   generate_reports: bool | None = None) -> list[Path]:
+    if transcribe_media is None:
+        transcribe_media = full
+    if generate_reports is None:
+        generate_reports = full
     store = Store(Path(config["runtime"]["state_db"]))
     adapter = None
     failures = 0
@@ -170,6 +241,7 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
     try:
         adapter = DouyinAdapter(config["browser"], config["crawl"])
         for input_url in urls:
+            _checkpoint(cancel_requested)
             try:
                 resolved = input_url
                 profile = is_profile(input_url)
@@ -184,7 +256,8 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                     previous = store.get_collection("douyin", identifier) if config["crawl"]["resume"] else None
                     discovery = adapter.discover_collection(
                         resolved, previous,
-                        on_progress=lambda partial: store.save_collection("douyin", partial))
+                        on_progress=lambda partial: (_checkpoint(cancel_requested),
+                                                     store.save_collection("douyin", partial))[-1])
                     store.save_collection("douyin", discovery)
                     LOG.info("合集发现 %s：%s 条，%s，%s", discovery.url,
                              len(discovery.video_urls), "完整" if discovery.complete else "未确认完整",
@@ -199,7 +272,8 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                     else:
                         discovery = adapter.discover(
                             resolved, config["inputs"]["max_videos_per_profile"], previous,
-                            on_progress=lambda partial: store.save_discovery("douyin", resolved, partial))
+                            on_progress=lambda partial: (_checkpoint(cancel_requested),
+                                                         store.save_discovery("douyin", resolved, partial))[-1])
                     store.save_discovery("douyin", resolved, discovery)
                     LOG.info("主页发现 %s：%s 条，%s，%s", resolved, len(discovery.video_urls),
                              "完整" if discovery.complete else "未确认完整", discovery.stop_reason)
@@ -207,14 +281,19 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                 else:
                     targets = [resolved]
                 for target in targets:
+                    _checkpoint(cancel_requested)
                     identifier = video_id(target)
                     if identifier:
                         active_video_ids.add(identifier)
-                    if not _process_video(adapter, store, target, config, full):
+                    if not _process_video(adapter, store, target, config, full, include_comments,
+                                          cancel_requested, on_progress, transcribe_media,
+                                          retain_download):
                         failures += 1
                 if (profile or collection) and not targets and not discovery.complete:
                     failures += 1
             except KeyboardInterrupt:
+                raise
+            except TaskCancelled:
                 raise
             except Exception as exc:
                 failures += 1
@@ -233,9 +312,12 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict[str, 
                         False, str(exc), prior.video_titles if prior else {}))
         if status is not None:
             status["failed"] = failures
+        _checkpoint(cancel_requested)
+        if generate_reports and on_progress:
+            on_progress("report", 92)
         return (generate(store, config["report"], video_ids=active_video_ids,
                          collection_ids=active_collection_ids,
-                         profile_urls=active_profile_urls) if full else [])
+                         profile_urls=active_profile_urls) if generate_reports else [])
     finally:
         if adapter:
             adapter.close()
