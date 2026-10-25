@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from .models import Video
 
@@ -20,3 +21,11 @@ def video_stem(video: Video) -> str:
     """Lead with the title; append the stable ID to prevent same-title collisions."""
     title = safe_filename(video.title or "标题未读取", 80)
     return f"{title}_{safe_filename(video.video_id, 32)}"
+
+
+def author_directory(root: Path | str, video: Video) -> Path:
+    return Path(root) / safe_filename(video.author_name or video.author_id or "未知作者", 40)
+
+
+def report_path(root: Path | str, video: Video) -> Path:
+    return author_directory(root, video) / f"{video_stem(video)}.md"

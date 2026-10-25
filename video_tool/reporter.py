@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from .naming import safe_filename, video_stem
+from .naming import author_directory, report_path, safe_filename, video_stem
 from .storage import Store
 
 
@@ -35,7 +35,8 @@ def generate(store: Store, config: dict, *, video_ids: set[str] | None = None,
     all_videos = store.all_videos()
     videos = [video for video in all_videos if video_ids is None or video.video_id in video_ids]
     for video in videos:
-        path = output / f"{video_stem(video)}.md"
+        path = report_path(output, video)
+        path.parent.mkdir(parents=True, exist_ok=True)
         discoveries = store.discoveries(video.platform, video.author_id) if video.author_id else []
         if profile_urls is not None:
             discoveries = [item for item in discoveries if item["profile_url"] in profile_urls]
@@ -111,7 +112,7 @@ def generate(store: Store, config: dict, *, video_ids: set[str] | None = None,
                               _quote(reply.text), ""])
         path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
         paths.append(path)
-        for outdated in output.glob(f"*_{safe_filename(video.video_id, 32)}.md"):
+        for outdated in output.rglob(f"*_{safe_filename(video.video_id, 32)}.md"):
             if outdated == path:
                 continue
             first_line = outdated.read_text(encoding="utf-8").splitlines()[:1]
@@ -124,7 +125,9 @@ def generate(store: Store, config: dict, *, video_ids: set[str] | None = None,
         key = (discovery["platform"], discovery["author_id"])
         if key in represented:
             continue
-        path = output / f"{safe_filename(discovery['platform'])}_profile_{safe_filename(discovery['author_id'] or 'unknown')}_discovery.md"
+        profile_output = output / safe_filename(discovery["author_name"] or discovery["author_id"] or "未知作者", 40)
+        profile_output.mkdir(parents=True, exist_ok=True)
+        path = profile_output / f"{safe_filename(discovery['platform'])}_profile_{safe_filename(discovery['author_id'] or 'unknown')}_discovery.md"
         path.write_text(f"# {escape(discovery['platform'])} · {escape(discovery['author_name'] or '未知博主')}\n\n"
                         f"主页：{escape(discovery['profile_url'])}\n\n"
                         f"发现作品：{discovery['video_count']}；"
@@ -132,7 +135,7 @@ def generate(store: Store, config: dict, *, video_ids: set[str] | None = None,
                         f"原因：{escape(discovery['stop_reason'])}\n", encoding="utf-8")
         paths.append(path)
     by_id = {(video.platform, video.video_id): video for video in all_videos}
-    generated_names = {path.name for path in paths}
+    generated_names = {path.relative_to(output).as_posix() for path in paths}
     for collection in store.all_collections():
         if collection_ids is not None and collection.collection_id not in collection_ids:
             continue
@@ -148,8 +151,8 @@ def generate(store: Store, config: dict, *, video_ids: set[str] | None = None,
             video = by_id.get(("douyin", identifier))
             label = escape(video.title if video and video.title else
                            collection.video_titles.get(identifier) or identifier or url)
-            report_name = f"{video_stem(video)}.md" if video else ""
-            title = f"[{label}]({quote(report_name, safe='')})" if report_name in generated_names else label
+            report_name = report_path(output, video).relative_to(output).as_posix() if video else ""
+            title = f"[{label}]({quote(report_name, safe='/')})" if report_name in generated_names else label
             state = (f"转写 {escape(video.transcript_status)}；"
                      f"评论{'完整' if video.comments_complete else '未确认完整'}"
                      if video else "待采集")

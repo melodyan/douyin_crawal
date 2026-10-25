@@ -12,7 +12,7 @@ import yaml
 from video_tool.config import DEFAULT_FILE, _walk, default_config_path, input_urls, load_config, parser_for, validate
 from video_tool.models import Collection, Comment, CommentResult, Discovery, SegmentResult, Video
 from video_tool.downloader import DownloadResult, download_images
-from video_tool.naming import safe_filename, video_stem
+from video_tool.naming import author_directory, report_path, safe_filename, video_stem
 from video_tool.pipeline import collect_or_run, download_one
 from video_tool.platforms.douyin import DouyinAdapter, _comment_objects, _video_sources, collection_id, likes_count, video_id
 from video_tool.reporter import generate
@@ -215,8 +215,8 @@ class CoreTests(unittest.TestCase):
                                      "include_comment_author": False, "write_partial_results": True})
             self.assertEqual({path.name for path in paths}, {"标题123_123.md", "标题456_456.md"})
             self.assertFalse((reports / "douyin_123.md").exists())
-            first = (reports / "标题123_123.md").read_text(encoding="utf-8")
-            second = (reports / "标题456_456.md").read_text(encoding="utf-8")
+            first = (reports / "作者" / "标题123_123.md").read_text(encoding="utf-8")
+            second = (reports / "作者" / "标题456_456.md").read_text(encoding="utf-8")
             self.assertIn("回复", first)
             self.assertIn("报告列出：1 条一级评论、1 条回复", first)
             self.assertNotIn("标题456", first)
@@ -608,7 +608,7 @@ class CoreTests(unittest.TestCase):
                 result = download_one(config, post.url)
             self.assertEqual(result, Path(directory) / "图文标题_123")
             images.assert_called_once()
-            self.assertEqual(images.call_args.args[1], Path(directory) / "图文标题_123")
+            self.assertEqual(images.call_args.args[1], Path(directory) / "未知作者" / "图文标题_123")
             video_download.assert_not_called()
 
     def test_run_downloads_note_without_transcriber(self):
@@ -643,8 +643,8 @@ class CoreTests(unittest.TestCase):
             config["report"]["output_dir"] = root / "reports"
             config["download"]["output_dir"] = root / "downloads"
             config["asr"]["api_key"] = "test"
-            media = root / "downloads" / "标题_123.mp4"
-            media.parent.mkdir()
+            media = root / "downloads" / "作者" / "标题_123.mp4"
+            media.parent.mkdir(parents=True)
             media.write_bytes(b"media")
             video = Video("douyin", "123", "https://www.douyin.com/video/123", "标题",
                           "author", "作者", tags_status="absent", media_urls=["https://media.example/v.mp4"],
@@ -705,8 +705,8 @@ class CoreTests(unittest.TestCase):
             store = Store(config["runtime"]["state_db"])
             store.save_video(previous)
             store.close()
-            media = root / "downloads" / "标题_123.mp4"
-            media.parent.mkdir()
+            media = root / "downloads" / "作者" / "标题_123.mp4"
+            media.parent.mkdir(parents=True)
             media.write_bytes(b"media")
             adapter = Mock()
             adapter.read_video.return_value = Video(
@@ -751,7 +751,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(old_report.read_text(encoding="utf-8"), "保留的旧报告")
             adapter.read_video.assert_not_called()
 
-    def test_missing_ffmpeg_is_logged_before_download(self):
+    def test_missing_ffmpeg_returns_specific_error_after_download(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = load_config(DEFAULT_FILE)
@@ -765,14 +765,16 @@ class CoreTests(unittest.TestCase):
             adapter.read_video.return_value = video
             adapter.read_comments.return_value = CommentResult([], True, "到底")
             with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter), \
-                 patch("video_tool.pipeline.download") as mocked_download, \
+                 patch("video_tool.pipeline.download", return_value=DownloadResult(root / "video.mp4", "video/mp4")) as mocked_download, \
                  patch("video_tool.pipeline.Transcriber") as mocked_asr:
                 mocked_asr.return_value.check_dependencies.side_effect = FileNotFoundError("找不到 FFmpeg：ffmpeg")
                 with self.assertLogs("video_tool.pipeline", level="ERROR") as logs:
                     status = {}
                     paths = collect_or_run(config, [video.url], True, status)
-            mocked_download.assert_not_called()
+            mocked_download.assert_called_once()
             self.assertEqual(status["failed"], 1)
+            self.assertEqual(status["failed_steps"], ["transcribe"])
+            self.assertIn("找不到 FFmpeg：ffmpeg", "\n".join(status["errors"]))
             self.assertIn("转写前检查失败", "\n".join(logs.output))
             self.assertIn("找不到 FFmpeg", paths[0].read_text(encoding="utf-8"))
 

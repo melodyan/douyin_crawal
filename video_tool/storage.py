@@ -46,6 +46,10 @@ class Store:
                 text TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (platform, video_id, segment_index)
             );
+            CREATE TABLE IF NOT EXISTS comment_marks (
+                platform TEXT NOT NULL, video_id TEXT NOT NULL, comment_id TEXT NOT NULL,
+                PRIMARY KEY (platform, video_id, comment_id)
+            );
             CREATE TABLE IF NOT EXISTS discoveries (
                 platform TEXT NOT NULL, profile_url TEXT NOT NULL, author_id TEXT NOT NULL DEFAULT '',
                 author_name TEXT NOT NULL DEFAULT '', complete INTEGER NOT NULL,
@@ -106,6 +110,21 @@ class Store:
 
     def close(self):
         self.db.close()
+
+    def marked_comments(self, platform: str, video_id: str) -> set[str]:
+        return {row[0] for row in self.db.execute(
+            "SELECT comment_id FROM comment_marks WHERE platform=? AND video_id=?", (platform, video_id))}
+
+    def mark_comment(self, platform: str, video_id: str, comment_id: str, marked: bool):
+        if not self.db.execute("SELECT 1 FROM comments WHERE platform=? AND video_id=? AND comment_id=?",
+                               (platform, video_id, comment_id)).fetchone():
+            raise ValueError("评论不存在")
+        with self.db:
+            if marked:
+                self.db.execute("INSERT OR IGNORE INTO comment_marks VALUES (?,?,?)", (platform, video_id, comment_id))
+            else:
+                self.db.execute("DELETE FROM comment_marks WHERE platform=? AND video_id=? AND comment_id=?",
+                                (platform, video_id, comment_id))
 
     def get_video(self, platform: str, video_id: str) -> Video | None:
         row = self.db.execute("SELECT * FROM videos WHERE platform=? AND video_id=?", (platform, video_id)).fetchone()
@@ -196,6 +215,17 @@ class Store:
 
     def all_videos(self) -> list[Video]:
         return [self._video(row) for row in self.db.execute("SELECT * FROM videos ORDER BY author_name,video_id")]
+
+    def delete_video(self, platform: str, video_id: str) -> bool:
+        with self.db:
+            # Delete dependent rows first when present, then delete the video row.
+            # SQLite DELETE is safe when a related row is already absent.
+            self.db.execute("DELETE FROM comment_marks WHERE platform=? AND video_id=?", (platform, video_id))
+            self.db.execute("DELETE FROM comments WHERE platform=? AND video_id=?", (platform, video_id))
+            self.db.execute("DELETE FROM segments WHERE platform=? AND video_id=?", (platform, video_id))
+            self.db.execute("DELETE FROM videos WHERE platform=? AND video_id=?", (platform, video_id))
+        # Make deletion idempotent: a stale list entry is treated as already deleted.
+        return True
 
     def comments(self, platform: str, video_id: str) -> list[Comment]:
         rows = self.db.execute("SELECT * FROM comments WHERE platform=? AND video_id=? ORDER BY likes DESC, comment_id",

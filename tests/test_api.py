@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 import api
 from video_tool.config import DEFAULT_FILE, load_config
 from video_tool.pipeline import TaskCancelled, collect_or_run
-from video_tool.models import Video
+from video_tool.models import Comment, CommentResult, Video
 from video_tool.storage import Store
 
 
@@ -46,6 +46,35 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(client.delete(f"/api/tasks/{task_id}").status_code, 200)
                 self.assertEqual(client.get("/api/tasks").json()["data"]["total"], 0)
 
+    def test_retry_reuses_task_and_rejects_duplicate_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root), patch.object(api.threading, "Thread"):
+                client = TestClient(api.app)
+                original = client.post("/api/tasks", json={
+                    "mode": "collect", "urls": ["https://www.douyin.com/video/123"],
+                    "options": {"title": "原任务"},
+                }).json()["data"]
+                task_id = original["id"]
+                self.assertEqual(client.post(f"/api/tasks/{task_id}/retry").status_code, 409)
+                api.CANCEL_EVENTS.clear()
+                original.update(state="failed", progress=70, error="旧错误", finished_at="old")
+                original["steps"]["collect"] = "failed"
+                api._save_task(original)
+                retried = client.post(f"/api/tasks/{task_id}/retry")
+                self.assertEqual(retried.status_code, 202, retried.text)
+                task = retried.json()["data"]
+                self.assertEqual(task["id"], task_id)
+                self.assertEqual(task["title"], original["title"])
+                self.assertEqual(task["created_at"], original["created_at"])
+                self.assertEqual(task["state"], "pending")
+                self.assertEqual(task["progress"], 0)
+                self.assertEqual(task["error"], "")
+                self.assertIsNone(task["finished_at"])
+                self.assertTrue(all(value == "pending" for value in task["steps"].values()))
+                self.assertEqual(client.get("/api/tasks").json()["data"]["total"], 1)
+                self.assertEqual(client.post(f"/api/tasks/{task_id}/retry").status_code, 409)
+
     def test_worker_updates_persisted_steps_and_completion(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._root(directory)
@@ -72,6 +101,217 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(saved["state"], "done")
                 self.assertEqual(saved["progress"], 100)
                 self.assertTrue(all(value == "done" for value in saved["steps"].values()))
+
+    def test_tag_options_and_multi_tag_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root):
+                store = api._store()
+                for identifier, author, desc in (("1", "甲", "#ai #知识库 #ai"), ("2", "乙", "#ai知识库"), ("3", "甲", "#生活")):
+                    store.save_video(Video("douyin", identifier, f"https://www.douyin.com/video/{identifier}",
+                                           author_name=author, description=desc))
+                store.close()
+                client = TestClient(api.app)
+                options = client.get("/api/video-tags", params={"q": "#ai"}).json()["data"]["items"]
+                self.assertEqual(options, [{"name": "ai", "count": 1}, {"name": "ai知识库", "count": 1}])
+                result = client.get("/api/videos", params=[("tags", "ai"), ("tags", "生活")]).json()["data"]
+                self.assertEqual(result["total"], 2)
+                result = client.get("/api/videos", params=[("tags", "ai知识库"), ("author_names", "甲")]).json()["data"]
+                self.assertEqual(result["total"], 0)
+                self.assertEqual(client.get("/api/videos", params={"tags": "#知识库"}).json()["data"]["total"], 1)
+                self.assertEqual(client.get("/api/videos").json()["data"]["total"], 3)
+
+    def test_video_list_extracts_hashtags_from_description(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root):
+                store = api._store()
+                store.save_video(Video("douyin", "123", "https://www.douyin.com/video/123",
+                    description="简介 #知识库 #ai #ai知识库 #实用干货分享 #智能体 #ai", hashtags=["知识库"]))
+                store.close()
+                item = TestClient(api.app).get("/api/videos").json()["data"]["items"][0]
+                self.assertEqual(item["hashtags"], ["知识库", "ai", "ai知识库", "实用干货分享", "智能体"])
+
+    def test_comment_marks_persist_after_recrawl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root):
+                store = api._store()
+                result = CommentResult([Comment("1", "评论"), Comment("2", "回复", parent_id="1")], True, "到底")
+                store.save_comments("douyin", "123", result)
+                store.close()
+                client = TestClient(api.app)
+                base = "/api/videos/douyin/123/comments"
+                self.assertEqual(client.put(base + "/2/mark", json={"marked": True}).status_code, 200)
+                store = api._store()
+                store.save_comments("douyin", "123", result, replace=True)
+                store.close()
+                items = client.get(base + "?marked_only=true").json()["data"]["items"]
+                self.assertEqual([item["comment_id"] for item in items], ["2"])
+                self.assertTrue(items[0]["marked"])
+                self.assertEqual(client.put(base + "/missing/mark", json={"marked": True}).status_code, 404)
+                self.assertEqual(client.put(base + "/2/mark", json={"marked": False}).status_code, 200)
+                self.assertEqual(client.get(base + "?marked_only=true").json()["data"]["total"], 0)
+
+    def test_author_name_options_and_multiple_name_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root):
+                store = api._store()
+                for identifier, name in (("1", "小严在努力"), ("2", "小严在努力"), ("3", "小王"), ("4", "其他作者")):
+                    store.save_video(Video("douyin", identifier, f"https://www.douyin.com/video/{identifier}",
+                                           author_name=name, author_id=f"id-{identifier}"))
+                store.close()
+                client = TestClient(api.app)
+                result = client.get("/api/video-authors", params={"q": "小严"}).json()["data"]["items"]
+                self.assertEqual(result, [{"name": "小严在努力", "count": 2}])
+                self.assertEqual(client.get("/api/video-authors", params={"q": "id-1"}).json()["data"]["items"], [])
+                selected = client.get("/api/videos", params=[("author_names", "小严在努力"), ("author_names", "小王")]).json()["data"]
+                self.assertEqual(selected["total"], 3)
+                self.assertEqual({v["author_name"] for v in selected["items"]}, {"小严在努力", "小王"})
+                self.assertEqual(client.get("/api/videos", params={"author_names": "小严"}).json()["data"]["total"], 0)
+                self.assertEqual(client.get("/api/videos").json()["data"]["total"], 4)
+
+    def test_author_file_migration_preserves_data_and_updates_playback_path(self):
+        from video_tool.migration import organize_author_files
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root):
+                config = api._config()
+                video = Video("douyin", "123", "https://www.douyin.com/video/123",
+                              title="标题", author_name="作者/名字", comments_complete=True,
+                              transcript="转写正文")
+                media = Path(config["download"]["output_dir"]) / "标题_123.mp4"
+                media.parent.mkdir(parents=True, exist_ok=True)
+                media.write_bytes(b"video")
+                video.local_media_path = str(media)
+                old_report = Path(config["report"]["output_dir"]) / f"{api.video_stem(video)}.md"
+                old_report.parent.mkdir(parents=True, exist_ok=True)
+                old_report.write_text("完整报告", encoding="utf-8")
+                store = api._store(config)
+                store.save_video(video)
+                store.close()
+                self.assertEqual(len(organize_author_files(config)), 2)
+                self.assertFalse(media.exists())
+                self.assertFalse(old_report.exists())
+                store = api._store(config)
+                saved = store.get_video("douyin", "123")
+                store.close()
+                self.assertEqual(Path(saved.local_media_path).parent.name, "作者_名字")
+                self.assertEqual(Path(saved.local_media_path).read_bytes(), b"video")
+                self.assertEqual(saved.transcript, "转写正文")
+                self.assertTrue(saved.comments_complete)
+                self.assertEqual(api.report_path(config["report"]["output_dir"], saved).read_text(encoding="utf-8"), "完整报告")
+                self.assertEqual(organize_author_files(config), [])
+                client = TestClient(api.app)
+                self.assertEqual(client.get("/api/videos/douyin/123/media").status_code, 200)
+                reports = client.get("/api/reports").json()["data"]["items"]
+                name = reports[0]["name"]
+                self.assertIn("作者_名字/", name)
+                self.assertEqual(client.get(f"/api/reports/{name}").status_code, 200)
+                self.assertNotEqual(client.get("/api/reports/../config.yaml").status_code, 200)
+
+    def test_report_button_reveals_existing_report_in_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root), patch.object(api.subprocess, "Popen") as launch:
+                config = api._config()
+                store = api._store(config)
+                video = Video("douyin", "123", "https://www.douyin.com/video/123", title="报告 测试")
+                store.save_video(video)
+                store.close()
+                client = TestClient(api.app)
+                url = "/api/videos/douyin/123/report/reveal"
+                self.assertEqual(client.post(url).status_code, 404)
+                launch.assert_not_called()
+                folder = Path(config["report"]["output_dir"])
+                folder.mkdir(parents=True, exist_ok=True)
+                report = api.report_path(folder, video)
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text("报告", encoding="utf-8")
+                response = client.post(url)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["data"]["path"], str(report.resolve()))
+                launch.assert_called_once_with(f'explorer.exe /select,"{report.resolve()}"')
+
+    def test_downloaded_video_supports_playback_and_seeking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            media = root / "video.mp4"
+            media.write_bytes(b"0123456789")
+            with patch.object(api, "ROOT", root):
+                store = api._store()
+                store.save_video(Video("douyin", "123", "https://www.douyin.com/video/123",
+                                       local_media_path=str(media)))
+                store.close()
+                client = TestClient(api.app)
+                url = "/api/videos/douyin/123/media"
+                response = client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["content-type"], "video/mp4")
+                self.assertEqual(response.content, b"0123456789")
+                partial = client.get(url, headers={"Range": "bytes=2-5"})
+                self.assertEqual(partial.status_code, 206)
+                self.assertEqual(partial.content, b"2345")
+                self.assertEqual(partial.headers["content-range"], "bytes 2-5/10")
+                media.unlink()
+                self.assertEqual(client.get(url).status_code, 404)
+                self.assertEqual(client.get("/api/videos/douyin/missing/media").status_code, 404)
+
+    def test_video_status_and_individual_actions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            media = root / "video.mp4"
+            media.write_bytes(b"video")
+            with patch.object(api, "ROOT", root), patch.object(api.threading, "Thread"):
+                store = api._store()
+                video = Video("douyin", "123", "https://www.douyin.com/video/123",
+                              title="测试视频", metadata_status="complete", comments_complete=True,
+                              local_media_path=str(media), transcript_status="failed")
+                store.save_video(video)
+                store.close()
+                client = TestClient(api.app)
+                listing = client.get("/api/videos").json()["data"]["items"][0]
+                self.assertTrue(listing["download_complete"])
+                self.assertTrue(listing["comments_complete"])
+                self.assertFalse(listing["report_complete"])
+                for action in ("download", "comments", "transcribe", "report"):
+                    api.CANCEL_EVENTS.clear()
+                    response = client.post(f"/api/videos/douyin/123/actions/{action}")
+                    self.assertEqual(response.status_code, 202, response.text)
+                    task = response.json()["data"]
+                    self.assertEqual(task["options"]["video_action"], action)
+                    listing = client.get("/api/videos").json()["data"]["items"][0]
+                    self.assertIn(action, listing["running_actions"])
+                    duplicate = client.post(f"/api/videos/douyin/123/actions/{action}")
+                    self.assertEqual(duplicate.status_code, 409)
+                    with patch.object(api, "_execute_video_action") as execute:
+                        api._run_task(task["id"], api.TaskRequest(mode=task["mode"], urls=task["urls"],
+                                      options=task["options"]), api._config())
+                    execute.assert_called_once_with(unittest.mock.ANY, "123", action)
+                    self.assertEqual(api._get_task(task["id"])["state"], "done")
+                media.unlink()
+                listing = client.get("/api/videos").json()["data"]["items"][0]
+                self.assertFalse(listing["download_complete"])
+                self.assertEqual(client.post("/api/videos/douyin/123/actions/transcribe").status_code, 422)
+
+    def test_worker_persists_full_failure_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root), patch.object(api.threading, "Thread"):
+                task = api._create_task(api.TaskRequest(
+                    mode="run", urls=["https://www.douyin.com/video/123"]))
+                errors = ["找不到 FFmpeg：ffmpeg", "转写请求失败：" + "详细原因" * 100]
+                def failed(_config, _urls, _full, status, **kwargs):
+                    status.update(failed=1, failed_steps=["transcribe"], errors=errors)
+                    return []
+                with patch.object(api, "collect_or_run", side_effect=failed):
+                    api._run_task(task["id"], api.TaskRequest(mode="run", urls=task["urls"]),
+                                  load_config(root / "config.yaml.bak"))
+                saved = api._get_task(task["id"])
+                self.assertEqual(saved["error"], "\n\n".join(errors))
+                self.assertEqual(saved["state"], "failed")
+                self.assertEqual(saved["steps"]["transcribe"], "failed")
 
     def test_worker_respects_individual_processing_modules(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -124,12 +364,37 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(response["values"]["crawl.delay_seconds"], 0.5)
                 self.assertNotIn("asr.api_key", response["values"])
                 self.assertTrue(response["secrets"]["asr.api_key"])
+                revealed = client.get("/api/config/api-key")
+                self.assertEqual(revealed.status_code, 200)
+                self.assertEqual(revealed.json()["data"]["value"], "secret-key")
+                self.assertEqual(revealed.headers["cache-control"], "no-store")
                 preserved = client.put("/api/config", json={"values": {"asr.api_key": ""}})
                 self.assertEqual(preserved.status_code, 200, preserved.text)
                 raw = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
                 self.assertEqual(raw["asr"]["api_key"], "secret-key")
                 rejected = client.put("/api/config", json={"values": {"unknown.option": 1}})
                 self.assertEqual(rejected.status_code, 422)
+
+    def test_config_nullable_limits_can_be_saved_and_round_tripped(self):
+        keys = (
+            "inputs.max_videos_per_profile", "inputs.max_videos_per_collection",
+            "crawl.max_comments_per_video", "report.top_comments",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root):
+                client = TestClient(api.app)
+                for value, expected in ((None, None), ("", None), ("12", 12)):
+                    with self.subTest(value=value):
+                        saved = client.put("/api/config", json={
+                            "values": dict.fromkeys(keys, value),
+                        })
+                        self.assertEqual(saved.status_code, 200, saved.text)
+                        values = client.get("/api/config").json()["data"]["values"]
+                        for key in keys:
+                            self.assertEqual(values[key], expected)
+                        round_trip = client.put("/api/config", json={"values": values})
+                        self.assertEqual(round_trip.status_code, 200, round_trip.text)
 
     def test_pipeline_honors_cancellation_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -182,7 +447,8 @@ class ApiTests(unittest.TestCase):
             with patch.object(api, "_config", return_value=config):
                 client = TestClient(api.app)
                 result = client.get("/api/videos", params={"author": "张", "title": "工具",
-                                                            "published_from": "2024-01-01", "published_to": "2024-12-31"})
+                                                            "published_from": "2024-01-01", "published_to": "2024-12-31",
+                                                            "source_url": "https://www.douyin.com/video/1"})
             self.assertEqual(result.status_code, 200, result.text)
             payload = result.json()["data"]
             self.assertEqual(payload["total"], 1)

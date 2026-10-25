@@ -7,7 +7,6 @@ type TaskModule = 'download' | 'transcribe' | 'comments' | 'report'
 type TaskState = '运行中' | '已完成' | '待处理' | '失败' | '已取消'
 type TranscriptState = '未转写' | '转写中' | '已转写'
 type CommentsState = '未采集' | '采集中' | '已采集'
-type StepStatus = 'done' | 'failed' | 'pending' | 'running' | 'cancelled'
 interface Task {
   id: string
   title: string
@@ -27,13 +26,13 @@ interface Task {
   transcriptState: TranscriptState
   commentsState: CommentsState
   inReadingList: boolean
-  videoStatus: StepStatus
-  commentsStatus: StepStatus
-  transcriptStatus: StepStatus
-  reportStatus: StepStatus
 }
 
 interface CollectedVideo {
+  download_complete: boolean
+  comments_complete: boolean
+  report_complete: boolean
+  running_actions: string[]
   platform: string
   video_id: string
   url: string
@@ -59,7 +58,7 @@ interface CollectedVideo {
   updated_at: string
 }
 
-interface VideoComment { comment_id: string; text: string; likes: number; author: string; parent_id: string; reply_to_id: string; author_id: string; published_at: string }
+interface VideoComment { marked: boolean; comment_id: string; text: string; likes: number; author: string; parent_id: string; reply_to_id: string; author_id: string; published_at: string }
 
 const storedPage = localStorage.getItem('douyin-current-page')
 const page = ref<Page>(storedPage === 'overview' || storedPage === 'tasks' || storedPage === 'videos' || storedPage === 'settings' ? storedPage : 'tasks')
@@ -76,14 +75,118 @@ const revealKey = ref(false)
 const secretConfigured = ref(false)
 const taskFilter = ref('全部任务')
 const appliedTaskFilter = ref('全部任务')
-const activeMenuTaskId = ref('')
 const deleteTarget = ref<Task | null>(null)
+const errorTarget = ref<Task | null>(null)
 const videos = ref<CollectedVideo[]>([])
 const videoTotal = ref(0)
-const videoSearch = reactive({ author: '', title: '', publishedFrom: localDate(), publishedTo: localDate() })
+const authorVideoGroups = computed(() => {
+  const groups = new Map<string, { key: string; name: string; authorId: string; videos: CollectedVideo[] }>()
+  for (const video of videos.value) {
+    const key = JSON.stringify([video.platform, video.author_id || video.author_name || `unknown:${video.video_id}`])
+    let group = groups.get(key)
+    if (!group) {
+      group = { key, name: video.author_name || '未知作者', authorId: video.author_id, videos: [] }
+      groups.set(key, group)
+    }
+    group.videos.push(video)
+  }
+  return [...groups.values()]
+})
+const videoSearch = reactive({ title: '', publishedFrom: '', publishedTo: '' })
+const selectedAuthorNames = ref<string[]>([])
+const authorOptions = ref<{ name: string; count: number }[]>([])
+const authorSearch = ref('')
+const authorDropdownOpen = ref(false)
+const authorOptionsLoading = ref(false)
+const authorOptionsFailed = ref(false)
+const authorPicker = ref<HTMLElement | null>(null)
+let authorSearchTimer: ReturnType<typeof setTimeout> | undefined
+let authorRequestVersion = 0
+async function loadAuthorOptions() {
+  const version = ++authorRequestVersion
+  authorOptionsLoading.value = true
+  authorOptionsFailed.value = false
+  try {
+    const result = await api<{ items: { name: string; count: number }[] }>(`/api/video-authors?q=${encodeURIComponent(authorSearch.value)}`)
+    if (version === authorRequestVersion) authorOptions.value = result.items
+  } catch { if (version === authorRequestVersion) authorOptionsFailed.value = true }
+  finally { if (version === authorRequestVersion) authorOptionsLoading.value = false }
+}
+function toggleAuthorDropdown() {
+  authorDropdownOpen.value = !authorDropdownOpen.value
+  if (authorDropdownOpen.value) loadAuthorOptions()
+}
+function closeAuthorDropdown(event: MouseEvent) {
+  if (authorPicker.value && !authorPicker.value.contains(event.target as Node)) authorDropdownOpen.value = false
+}
+watch(authorSearch, () => { clearTimeout(authorSearchTimer); authorSearchTimer = setTimeout(loadAuthorOptions, 200) })
+const selectedTags = ref<string[]>([])
+const tagOptions = ref<{ name: string; count: number }[]>([])
+const tagSearch = ref('')
+const tagDropdownOpen = ref(false)
+const tagOptionsLoading = ref(false)
+const tagOptionsFailed = ref(false)
+const tagPicker = ref<HTMLElement | null>(null)
+let tagSearchTimer: ReturnType<typeof setTimeout> | undefined
+let tagRequestVersion = 0
+async function loadTagOptions() {
+  const version = ++tagRequestVersion
+  tagOptionsLoading.value = true
+  tagOptionsFailed.value = false
+  try {
+    const result = await api<{ items: { name: string; count: number }[] }>(`/api/video-tags?q=${encodeURIComponent(tagSearch.value)}`)
+    if (version === tagRequestVersion) tagOptions.value = result.items
+  } catch { if (version === tagRequestVersion) tagOptionsFailed.value = true }
+  finally { if (version === tagRequestVersion) tagOptionsLoading.value = false }
+}
+function toggleTagDropdown() {
+  tagDropdownOpen.value = !tagDropdownOpen.value
+  if (tagDropdownOpen.value) loadTagOptions()
+}
+function closeTagDropdown(event: MouseEvent) {
+  if (tagPicker.value && !tagPicker.value.contains(event.target as Node)) tagDropdownOpen.value = false
+}
+watch(tagSearch, () => { clearTimeout(tagSearchTimer); tagSearchTimer = setTimeout(loadTagOptions, 200) })
+const taskDateDropdownOpen = ref(false)
+const taskDatePicker = ref<HTMLElement | null>(null)
+const taskDateLabel = computed(() => {
+  const from = filters.collectedFrom
+  const to = filters.collectedTo
+  return from && to ? `${from} 至 ${to}` : from ? `${from} 起` : to ? `截至 ${to}` : '任务创建时间'
+})
+function closeTaskDateDropdown(event: MouseEvent) {
+  if (taskDatePicker.value && !taskDatePicker.value.contains(event.target as Node)) taskDateDropdownOpen.value = false
+}
+const dateDropdownOpen = ref(false)
+const datePicker = ref<HTMLElement | null>(null)
+const videoDateLabel = computed(() => {
+  const from = videoSearch.publishedFrom
+  const to = videoSearch.publishedTo
+  return from && to ? `${from} 至 ${to}` : from ? `${from} 起` : to ? `截至 ${to}` : '视频发布时间'
+})
+function closeDateDropdown(event: MouseEvent) {
+  if (datePicker.value && !datePicker.value.contains(event.target as Node)) dateDropdownOpen.value = false
+}
+const videoSourceUrl = ref('')
 const selectedVideo = ref<CollectedVideo | null>(null)
+const deleteVideoTarget = ref<CollectedVideo | null>(null)
 const selectedVideoComments = ref<VideoComment[]>([])
+const markedCommentsOnly = ref(false)
+const markingComments = ref<string[]>([])
+const markedCommentCount = computed(() => selectedVideoComments.value.filter((comment) => comment.marked).length)
+const visibleVideoComments = computed(() => markedCommentsOnly.value ? selectedVideoComments.value.filter((comment) => comment.marked) : selectedVideoComments.value)
+async function toggleCommentMark(comment: VideoComment) {
+  const video = selectedVideo.value
+  if (!video || markingComments.value.includes(comment.comment_id)) return
+  markingComments.value.push(comment.comment_id)
+  try {
+    const result = await api<{ marked: boolean }>(`/api/videos/${encodeURIComponent(video.platform)}/${encodeURIComponent(video.video_id)}/comments/${encodeURIComponent(comment.comment_id)}/mark`, { method: 'PUT', body: JSON.stringify({ marked: !comment.marked }) })
+    comment.marked = result.marked
+  } catch (error) { notify(`标记保存失败：${(error as Error).message}`) }
+  finally { markingComments.value = markingComments.value.filter((id) => id !== comment.comment_id) }
+}
 const videoCommentsLoading = ref(false)
+const videoPlaybackError = ref(false)
 function localDate(offsetDays = 0) { const date = new Date(); date.setDate(date.getDate() + offsetDays); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}` }
 const filters = reactive({ videoName: '', collectedFrom: localDate(), collectedTo: localDate() })
 const appliedFilters = reactive({ ...filters })
@@ -186,48 +289,129 @@ function taskFromApi(item: any): Task {
   const steps = item.steps || {}
   const input = (item.urls || []).join('\n')
   const displayMode = input.includes('/collection/') ? '短视频合集' : input.includes('/user/') ? '指定作者' : '单个短视频'
-  return { id: item.id, title: item.title || item.mode || '采集任务', mode: displayMode, module: item.mode === 'run' ? '完整处理' : '仅采集', input, state, progress: item.progress || 0, createdAt: item.created_at || '', collectedAt: (item.created_at || '').slice(0, 10), publishedAt: '', author: '采集任务', transcript: item.error || '', likes: 0, favorites: 0, shares: 0, transcriptState: steps.transcribe === 'done' ? '已转写' : steps.transcribe === 'running' ? '转写中' : '未转写', commentsState: steps.comments === 'done' ? '已采集' : steps.comments === 'running' ? '采集中' : '未采集', inReadingList: readingIds.has(item.id), videoStatus: steps.download || steps.collect || 'pending', commentsStatus: steps.comments || 'pending', transcriptStatus: steps.transcribe || 'pending', reportStatus: steps.report || 'pending' }
+  return { id: item.id, title: item.title || item.mode || '采集任务', mode: displayMode, module: item.mode === 'run' ? '完整处理' : '仅采集', input, state, progress: item.progress || 0, createdAt: item.created_at || '', collectedAt: (item.created_at || '').slice(0, 10), publishedAt: '', author: '采集任务', transcript: item.error || '', likes: 0, favorites: 0, shares: 0, transcriptState: steps.transcribe === 'done' ? '已转写' : steps.transcribe === 'running' ? '转写中' : '未转写', commentsState: steps.comments === 'done' ? '已采集' : steps.comments === 'running' ? '采集中' : '未采集', inReadingList: readingIds.has(item.id)}
 }
 async function refreshTasks() {
   try { const result = await api<{ items: any[] }>('/api/tasks'); tasks.value = result.items.map(taskFromApi) } catch (error) { notify(`后端未连接：${(error as Error).message}`) }
 }
 async function refreshVideos() {
+  if (videoSearch.publishedFrom && videoSearch.publishedTo && videoSearch.publishedFrom > videoSearch.publishedTo) {
+    notify('开始日期不能晚于结束日期')
+    return
+  }
   const query = new URLSearchParams()
-  if (videoSearch.author.trim()) query.set('author', videoSearch.author.trim())
+  for (const name of selectedAuthorNames.value) query.append('author_names', name)
+  for (const tag of selectedTags.value) query.append('tags', tag)
   if (videoSearch.title.trim()) query.set('title', videoSearch.title.trim())
   if (videoSearch.publishedFrom) query.set('published_from', videoSearch.publishedFrom)
   if (videoSearch.publishedTo) query.set('published_to', videoSearch.publishedTo)
+  if (videoSourceUrl.value) query.set('source_url', videoSourceUrl.value)
   try {
+    query.set('limit', '500')
     const result = await api<{ items: CollectedVideo[]; total: number }>(`/api/videos?${query.toString()}`)
+    while (result.items.length < result.total) {
+      query.set('offset', String(result.items.length))
+      const next = await api<{ items: CollectedVideo[]; total: number }>(`/api/videos?${query.toString()}`)
+      if (!next.items.length) break
+      result.items.push(...next.items)
+    }
     videos.value = result.items
+    if (selectedVideo.value) {
+      const updated = result.items.find((item) => item.platform === selectedVideo.value?.platform && item.video_id === selectedVideo.value?.video_id)
+      if (updated) Object.assign(selectedVideo.value, updated)
+    }
     videoTotal.value = result.total
   } catch (error) { notify(`视频数据读取失败：${(error as Error).message}`) }
 }
 async function openVideoDetail(video: CollectedVideo) {
   selectedVideo.value = video
+  videoPlaybackError.value = false
   selectedVideoComments.value = []
+  markedCommentsOnly.value = false
   videoCommentsLoading.value = true
   try {
-    const result = await api<{ items: VideoComment[] }>(`/api/videos/${encodeURIComponent(video.platform)}/${encodeURIComponent(video.video_id)}/comments?limit=500`)
-    selectedVideoComments.value = result.items
+    const result = await api<{ items: VideoComment[]; total: number }>(`/api/videos/${encodeURIComponent(video.platform)}/${encodeURIComponent(video.video_id)}/comments?limit=500`)
+    while (result.items.length < result.total) {
+      const next = await api<{ items: VideoComment[]; total: number }>(`/api/videos/${encodeURIComponent(video.platform)}/${encodeURIComponent(video.video_id)}/comments?limit=500&offset=${result.items.length}`)
+      if (!next.items.length) break
+      result.items.push(...next.items)
+    }
+    if (selectedVideo.value?.video_id === video.video_id && selectedVideo.value?.platform === video.platform) selectedVideoComments.value = result.items
   } catch (error) { notify(`评论读取失败：${(error as Error).message}`) }
   finally { videoCommentsLoading.value = false }
 }
-function resetVideoSearch() { videoSearch.author = ''; videoSearch.title = ''; videoSearch.publishedFrom = localDate(); videoSearch.publishedTo = localDate(); refreshVideos() }
+async function confirmDeleteVideo() {
+  if (!deleteVideoTarget.value) return
+  const target = deleteVideoTarget.value
+  try {
+    await api(`/api/videos/${encodeURIComponent(target.platform)}/${encodeURIComponent(target.video_id)}`, { method: 'DELETE' })
+    videos.value = videos.value.filter((video) => video.platform !== target.platform || video.video_id !== target.video_id)
+    videoTotal.value = Math.max(0, videoTotal.value - 1)
+    if (selectedVideo.value?.platform === target.platform && selectedVideo.value.video_id === target.video_id) selectedVideo.value = null
+    deleteVideoTarget.value = null
+    notify(`已删除视频记录“${target.title || target.video_id}”`)
+  } catch (error) { notify(`删除视频失败：${(error as Error).message}`) }
+}
+function resetVideoSearch() { videoSourceUrl.value = ''; selectedAuthorNames.value = []; authorSearch.value = ''; authorDropdownOpen.value = false; selectedTags.value = []; tagSearch.value = ''; tagDropdownOpen.value = false; dateDropdownOpen.value = false; videoSearch.title = ''; videoSearch.publishedFrom = ''; videoSearch.publishedTo = ''; refreshVideos() }
+function openTaskVideos(task: Task) {
+  const source = task.input.split('\n').map((item) => item.trim()).find(Boolean)
+  if (!source) { notify('该任务没有可用的采集链接'); return }
+  page.value = 'videos'
+  videoSourceUrl.value = source
+  selectedAuthorNames.value = []
+  selectedTags.value = []
+  tagSearch.value = ''
+  tagDropdownOpen.value = false
+  authorSearch.value = ''
+  authorDropdownOpen.value = false
+  videoSearch.title = ''
+  videoSearch.publishedFrom = ''
+  videoSearch.publishedTo = ''
+  refreshVideos()
+}
 function setVideoDateRange(range: 'today' | 'yesterday' | 'week' | 'month') {
   const endOffset = range === 'yesterday' ? -1 : 0
   const startOffset = range === 'week' ? -6 : range === 'month' ? -29 : endOffset
   videoSearch.publishedFrom = localDate(startOffset)
   videoSearch.publishedTo = localDate(endOffset)
+  dateDropdownOpen.value = false
   refreshVideos()
 }
 function formatCount(value: number) { return new Intl.NumberFormat('zh-CN').format(value || 0) }
 function formatDateTime(value: string) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—' }
-function processingLabel(video: CollectedVideo) {
-  if (video.metadata_status === 'failed') return '采集失败'
-  if (video.transcript_status === 'complete') return '已转写'
-  if (video.local_media_path) return '已下载'
-  return video.metadata_status === 'complete' ? '已采集' : '部分数据'
+function processingLabel(video: CollectedVideo) { return video.transcript_status === 'complete' ? '已转写' : video.local_media_path ? '已下载' : video.metadata_status === 'failed' ? '采集失败' : '已采集' }
+type VideoAction = 'download' | 'comments' | 'transcribe' | 'report'
+const videoActions: { key: VideoAction; done: string; pending: string; icon: string }[] = [
+  { key: 'download', done: '视频已下载', pending: '视频未下载', icon: '↓' },
+  { key: 'comments', done: '评论已抓取', pending: '评论未抓取', icon: '☰' },
+  { key: 'transcribe', done: '转写已完成', pending: '转写未完成', icon: '文' },
+  { key: 'report', done: '已生成报告', pending: '未生成报告', icon: '▤' },
+]
+const submittingVideoActions = ref<string[]>([])
+function videoActionDone(video: CollectedVideo, action: VideoAction) {
+  return action === 'download' ? video.download_complete : action === 'comments' ? video.comments_complete : action === 'transcribe' ? video.transcript_status === 'complete' : video.report_complete
+}
+function videoActionBusy(video: CollectedVideo, action: VideoAction) {
+  return submittingVideoActions.value.includes(`${video.video_id}:${action}`) || video.running_actions?.includes(action)
+}
+async function startVideoAction(video: CollectedVideo, action: VideoAction) {
+  const key = `${video.video_id}:${action}`
+  if (action === 'report' && video.report_complete) {
+    try {
+      const result = await api<{ path: string }>(`/api/videos/${encodeURIComponent(video.platform)}/${encodeURIComponent(video.video_id)}/report/reveal`, { method: 'POST' })
+      notify(`报告位置：${result.path}`)
+    } catch (error) { notify(`打开报告失败：${(error as Error).message}`) }
+    return
+  }
+  if (videoActionDone(video, action) || videoActionBusy(video, action)) return
+  submittingVideoActions.value.push(key)
+  try {
+    await api(`/api/videos/${encodeURIComponent(video.platform)}/${encodeURIComponent(video.video_id)}/actions/${action}`, { method: 'POST' })
+    notify('已启动对应流程，可在任务列表查看进度和错误')
+    await refreshVideos()
+    await refreshTasks()
+  } catch (error) { notify(`启动失败：${(error as Error).message}`) }
+  finally { submittingVideoActions.value = submittingVideoActions.value.filter((item) => item !== key) }
 }
 
 const modeOptions = [
@@ -284,41 +468,23 @@ function toggleModule(id: TaskModule) {
     activeModules.value = [...activeModules.value, id]
   }
 }
-function transcribe(task: Task) {
-  if (task.transcriptState === '转写中') return
-  activeMenuTaskId.value = ''
-  api('/api/tasks', { method: 'POST', body: JSON.stringify({ mode: 'run', urls: task.input.split('\n').filter(Boolean), options: { title: `${task.title} · 重新转写`, download_video: true, transcribe_text: true, include_comments: false, generate_report: false, force_reprocess: true } }) }).then(() => { notify(`“${task.title}”已加入转写队列`); refreshTasks() }).catch((error) => notify(`提交失败：${error.message}`))
-}
-function pullComments(task: Task) {
-  if (task.commentsState === '采集中') return
-  activeMenuTaskId.value = ''
-  api('/api/tasks', { method: 'POST', body: JSON.stringify({ mode: 'collect', urls: task.input.split('\n').filter(Boolean), options: { title: `${task.title} · 更新评论`, download_video: false, transcribe_text: false, include_comments: true, generate_report: false, force_reprocess: true } }) }).then(() => { notify(`“${task.title}”已加入评论采集队列`); refreshTasks() }).catch((error) => notify(`提交失败：${error.message}`))
-}
-function retryTask(task: Task) { activeMenuTaskId.value = ''; api(`/api/tasks/${task.id}/retry`, { method: 'POST' }).then(() => { notify('已创建重试任务'); refreshTasks() }).catch((error) => notify(`重试失败：${error.message}`)) }
-function cancelTask(task: Task) { activeMenuTaskId.value = ''; api(`/api/tasks/${task.id}/cancel`, { method: 'POST' }).then(() => { notify('已请求取消任务'); refreshTasks() }).catch((error) => notify(`取消失败：${error.message}`)) }
-function statusLabel(label: string, status: StepStatus) {
-  return `${label}${status === 'done' ? '已完成' : status === 'failed' ? '失败' : status === 'cancelled' ? '已取消' : status === 'running' ? '处理中' : '未处理'}`
-}
 function toggleReading(task: Task) {
   task.inReadingList = !task.inReadingList
   if (task.inReadingList) readingIds.add(task.id); else readingIds.delete(task.id)
   localStorage.setItem('douyin-reading-tasks', JSON.stringify([...readingIds]))
-  activeMenuTaskId.value = ''
   notify(task.inReadingList ? '已加入阅读' : '已从阅读列表移除')
 }
 function confirmDelete() {
   if (!deleteTarget.value) return
   const title = deleteTarget.value.title
   const id = deleteTarget.value.id
-  api(`/api/tasks/${id}`, { method: 'DELETE' }).then(() => { tasks.value = tasks.value.filter((task) => task.id !== id); deleteTarget.value = null; activeMenuTaskId.value = ''; notify(`已删除“${title}”`) }).catch((error) => notify(`删除失败：${error.message}`))
-}
-function closeMenus(event: MouseEvent) {
-  if (!(event.target as HTMLElement).closest('.row-actions')) activeMenuTaskId.value = ''
+  api(`/api/tasks/${id}`, { method: 'DELETE' }).then(() => { tasks.value = tasks.value.filter((task) => task.id !== id); deleteTarget.value = null; notify(`已删除“${title}”`) }).catch((error) => notify(`删除失败：${error.message}`))
 }
 let eventSource: EventSource | null = null
-onMounted(() => { document.documentElement.style.setProperty('--font-offset', `${fontOffset.value}px`); document.addEventListener('click', closeMenus); refreshTasks(); refreshVideos(); loadSettings(); eventSource = new EventSource(`${API_BASE}/api/tasks/events`); eventSource.addEventListener('tasks', (event) => { tasks.value = JSON.parse((event as MessageEvent).data).map(taskFromApi) }) })
-onBeforeUnmount(() => { document.removeEventListener('click', closeMenus); eventSource?.close() })
+onMounted(() => { document.addEventListener('click', closeAuthorDropdown); document.addEventListener('click', closeTagDropdown); document.addEventListener('click', closeDateDropdown); document.addEventListener('click', closeTaskDateDropdown); document.documentElement.style.setProperty('--font-offset', `${fontOffset.value}px`); refreshTasks(); refreshVideos(); loadSettings(); eventSource = new EventSource(`${API_BASE}/api/tasks/events`); eventSource.addEventListener('tasks', (event) => { tasks.value = JSON.parse((event as MessageEvent).data).map(taskFromApi); if (page.value === 'videos') refreshVideos() }) })
+onBeforeUnmount(() => { document.removeEventListener('click', closeAuthorDropdown); document.removeEventListener('click', closeTagDropdown); document.removeEventListener('click', closeDateDropdown); document.removeEventListener('click', closeTaskDateDropdown); clearTimeout(authorSearchTimer); clearTimeout(tagSearchTimer); eventSource?.close() })
 function clearFilters() {
+  taskDateDropdownOpen.value = false
   taskFilter.value = '全部任务'
   appliedTaskFilter.value = '全部任务'
   Object.assign(filters, { videoName: '', collectedFrom: localDate(), collectedTo: localDate() })
@@ -329,16 +495,50 @@ function setDateRange(range: 'today' | 'yesterday' | 'week' | 'month') {
   const startOffset = range === 'week' ? -6 : range === 'month' ? -29 : endOffset
   filters.collectedFrom = localDate(startOffset)
   filters.collectedTo = localDate(endOffset)
+  taskDateDropdownOpen.value = false
   applyFilters()
 }
 function applyFilters() {
+  if (filters.collectedFrom && filters.collectedTo && filters.collectedFrom > filters.collectedTo) {
+    notify('开始日期不能晚于结束日期')
+    return
+  }
   appliedTaskFilter.value = taskFilter.value
   Object.assign(appliedFilters, filters)
   notify(`查询完成，找到 ${visibleTasks.value.length} 条任务`)
 }
 function changeFontSize(delta: number) { fontOffset.value = Math.min(6, Math.max(0, fontOffset.value + delta)); document.documentElement.style.setProperty('--font-offset', `${fontOffset.value}px`); localStorage.setItem('douyin-font-offset', String(fontOffset.value)) }
+const keyLoading = ref(false)
+async function toggleApiKey() {
+  if (revealKey.value) { revealKey.value = false; return }
+  if (!config['asr.api_key'] && secretConfigured.value) {
+    keyLoading.value = true
+    try {
+      const result = await api<{ value: string }>('/api/config/api-key')
+      config['asr.api_key'] = result.value
+    } catch (error) {
+      notify(`读取 API Key 失败：${(error as Error).message}`)
+      return
+    } finally { keyLoading.value = false }
+  }
+  revealKey.value = true
+}
+const retryingTasks = ref<string[]>([])
+async function retryTask(task: Task) {
+  if (retryingTasks.value.includes(task.id) || task.state === '运行中' || task.state === '待处理') return
+  retryingTasks.value.push(task.id)
+  try {
+    await api(`/api/tasks/${task.id}/retry`, { method: 'POST' })
+    notify(`已重新启动“${task.title}”`)
+    await refreshTasks()
+  } catch (error) {
+    notify(`重试失败：${(error as Error).message}`)
+  } finally {
+    retryingTasks.value = retryingTasks.value.filter((id) => id !== task.id)
+  }
+}
 function saveSettings() {
-  api('/api/config', { method: 'PUT', body: JSON.stringify({ values: { ...config } }) }).then(() => { secretConfigured.value ||= Boolean(config['asr.api_key']); config['asr.api_key'] = ''; notify('配置已保存到后端') }).catch((error) => notify(`配置保存失败：${error.message}`))
+  api('/api/config', { method: 'PUT', body: JSON.stringify({ values: { ...config } }) }).then(() => { secretConfigured.value ||= Boolean(config['asr.api_key']); config['asr.api_key'] = ''; revealKey.value = false; notify('配置已保存到后端') }).catch((error) => notify(`配置保存失败：${error.message}`))
 }
 function resetSettings() {
   Object.assign(config, defaultConfig)
@@ -359,7 +559,7 @@ watch(page, (value) => localStorage.setItem('douyin-current-page', value))
       <div class="side-label">工作空间</div>
       <button class="nav-item" :class="{ active: page === 'overview' }" @click="page = 'overview'"><span class="nav-icon">▧</span><span>概况预览</span><span v-if="page === 'overview'" class="nav-current"></span></button>
       <button class="nav-item" :class="{ active: page === 'tasks' }" @click="page = 'tasks'"><span class="nav-icon">▦</span><span>任务列表</span><span v-if="page === 'tasks'" class="nav-current"></span></button>
-      <button class="nav-item" :class="{ active: page === 'videos' }" @click="page = 'videos'; refreshVideos()"><span class="nav-icon">▶</span><span>采集视频</span><span v-if="page === 'videos'" class="nav-current"></span></button>
+      <button class="nav-item" :class="{ active: page === 'videos' }" @click="page = 'videos'; resetVideoSearch()"><span class="nav-icon">▶</span><span>采集视频</span><span v-if="page === 'videos'" class="nav-current"></span></button>
       <div class="side-label settings-label">偏好设置</div>
       <button class="nav-item" :class="{ active: page === 'settings' }" @click="page = 'settings'"><span class="nav-icon">⚙</span><span>采集配置</span><span v-if="page === 'settings'" class="nav-current"></span></button>
       <div class="sidebar-bottom"><div class="runtime-card"><div class="runtime-head"><span class="status-dot"></span>本地工作模式</div><p>任务由本机 Python 服务处理<br />状态保存在 SQLite</p><div class="runtime-chip">工作台 <span>v0.2</span></div></div><div class="user-row"><div class="avatar">W</div><div><strong>本机用户</strong><small>个人工作空间</small></div><span class="dots">···</span></div></div>
@@ -375,12 +575,12 @@ watch(page, (value) => localStorage.setItem('douyin-current-page', value))
       </section>
 
       <section v-else-if="page === 'tasks'" class="page-content">
-        <div class="page-heading"><div><div class="eyebrow">WORKSPACE <span>·</span> 任务中心</div><h1>任务列表</h1><p>查看任务进度、处理步骤和错误信息。</p></div><button class="primary-button" @click="showCreate = true"><span>＋</span> 新建任务</button></div>
+        <div class="page-heading"><div><div class="eyebrow">WORKSPACE <span>·</span> 任务中心</div><h1>任务列表</h1><p>查看任务进度、状态和错误信息。</p></div><button class="primary-button" @click="showCreate = true"><span>＋</span> 新建任务</button></div>
 
-        <section class="search-panel">
+        <section class="search-panel task-search-panel">
           <div class="search-main">
             <label class="search-box title-search"><span>⌕</span><input v-model="filters.videoName" placeholder="任务名称" @keyup.enter="applyFilters" /></label>
-            <div class="filter-field inline-date"><label>采集时间</label><div class="range-inputs"><input v-model="filters.collectedFrom" type="date" aria-label="采集时间开始" /><span>至</span><input v-model="filters.collectedTo" type="date" aria-label="采集时间结束" /></div><div class="date-shortcuts"><button @click="setDateRange('today')">今天</button><button @click="setDateRange('yesterday')">昨天</button><button @click="setDateRange('week')">近一周</button><button @click="setDateRange('month')">近一月</button></div></div>
+            <div ref="taskDatePicker" class="video-date-picker" @keydown.esc.stop="taskDateDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="taskDateDropdownOpen" aria-controls="task-date-menu" :title="taskDateLabel" @click="taskDateDropdownOpen = !taskDateDropdownOpen"><svg viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true"><rect x="3" y="4" width="14" height="13" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M6 2v4m8-4v4M3 9h14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><span class="author-selection-text">{{ taskDateLabel }}</span><span>⌄</span></button><div v-if="taskDateDropdownOpen" id="task-date-menu" class="video-date-menu"><div class="date-menu-heading"><strong>任务创建时间</strong><button type="button" @click="filters.collectedFrom = ''; filters.collectedTo = ''; taskDateDropdownOpen = false; applyFilters()">清空</button></div><div class="date-menu-fields"><label>开始日期<input id="task-created-from" v-model="filters.collectedFrom" type="date" :max="filters.collectedTo || undefined" @change="applyFilters" /></label><span>至</span><label>结束日期<input v-model="filters.collectedTo" type="date" :min="filters.collectedFrom || undefined" @change="applyFilters" /></label></div><div class="date-menu-shortcuts"><button type="button" @click="setDateRange('today')">今天</button><button type="button" @click="setDateRange('yesterday')">昨天</button><button type="button" @click="setDateRange('week')">近一周</button><button type="button" @click="setDateRange('month')">近一月</button></div></div></div>
             <select v-model="taskFilter" aria-label="任务状态"><option>全部任务</option><option>运行中</option><option>已完成</option><option>待处理</option><option>失败</option><option>已取消</option></select>
             <button class="primary-button query-button" @click="applyFilters">查询</button>
           </div>
@@ -398,26 +598,46 @@ watch(page, (value) => localStorage.setItem('douyin-current-page', value))
         </div></section>
 
         <section class="task-panel"><div class="task-panel-head"><div><h2>最近任务</h2><p>按创建时间倒序排列</p></div><span class="recent-count">{{ visibleTasks.length }} 条记录</span></div>
-          <div class="task-table-wrap"><table class="task-table"><thead><tr><th>任务</th><th>类型</th><th>创建时间</th><th>进度</th><th>状态</th><th>错误信息</th><th>处理步骤</th><th>操作</th></tr></thead><tbody><tr v-for="task in visibleTasks" :key="task.id"><td><div class="task-name"><div class="task-type-icon" :class="task.mode === '指定作者' ? 'author' : task.mode === '短视频合集' ? 'collection' : ''">{{ task.mode === '指定作者' ? '◎' : task.mode === '短视频合集' ? '▤' : '▶' }}</div><div class="video-title"><strong>{{ task.title }}</strong><small>{{ task.id }} · {{ task.collectedAt }}</small></div><button class="bookmark-button" :class="{ bookmarked: task.inReadingList }" :aria-label="task.inReadingList ? '取消标记' : '标记任务'" :title="task.inReadingList ? '已标记' : '标记任务'" @click.stop="toggleReading(task)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.75 4.75h10.5a1 1 0 0 1 1 1v14l-6.25-3.8-6.25 3.8v-14a1 1 0 0 1 1-1Z" /></svg></button></div></td><td><div class="author-cell">{{ task.mode }}</div></td><td class="time-cell">{{ task.createdAt || '—' }}</td><td class="metric-cell">{{ task.progress }}%</td><td>{{ task.state }}</td><td>{{ task.transcript || '—' }}</td><td><div class="step-statuses"><div v-for="step in [{ key: 'video', label: '视频已下载', status: task.videoStatus }, { key: 'transcript', label: '转写已完成', status: task.transcriptStatus }, { key: 'comments', label: '评论已扫描', status: task.commentsStatus }, { key: 'report', label: '报告已生成', status: task.reportStatus }]" :key="step.key" class="step-status" :class="step.status" :title="statusLabel(step.label, step.status)" :aria-label="statusLabel(step.label, step.status)"><span class="step-indicator">{{ step.status === 'done' ? '✓' : step.status === 'failed' ? '×' : step.status === 'running' ? '…' : '·' }}</span><small>{{ step.key === 'video' ? '视频' : step.key === 'transcript' ? '转写' : step.key === 'comments' ? '评论' : '报告' }}</small></div></div></td><td><div class="row-actions"><button class="more-button" :aria-label="activeMenuTaskId === task.id ? '收起操作菜单' : '打开操作菜单'" :aria-expanded="activeMenuTaskId === task.id" @click.stop="activeMenuTaskId = activeMenuTaskId === task.id ? '' : task.id"><span>⋮</span> 操作 <b>{{ activeMenuTaskId === task.id ? '⌃' : '⌄' }}</b></button><div v-if="activeMenuTaskId === task.id" class="action-menu"><button v-if="task.state === '运行中' || task.state === '待处理'" @click.stop="cancelTask(task)"><span>×</span>取消任务<small>当前步骤返回后停止</small></button><button v-else @click.stop="retryTask(task)"><span>↻</span>重试任务<small>使用原输入重新处理</small></button><button :disabled="task.transcriptState === '转写中'" @click.stop="transcribe(task)"><span>◖</span>{{ task.transcriptState === '已转写' ? '重新转写' : task.transcriptState === '转写中' ? '转写中…' : '转写' }}<small>{{ task.transcriptState === '已转写' ? '覆盖现有转写内容' : task.transcriptState }}</small></button><button :disabled="task.commentsState === '采集中'" @click.stop="pullComments(task)"><span>☷</span>{{ task.commentsState === '已采集' ? '重新拉取评论' : task.commentsState === '采集中' ? '正在拉取评论…' : '拉取评论' }}<small>{{ task.commentsState === '已采集' ? '更新评论及回复' : task.commentsState }}</small></button><div class="menu-divider"></div><button class="danger-action" @click.stop="deleteTarget = task; activeMenuTaskId = ''"><span>⌫</span>删除<small>删除任务记录</small></button></div></div></td></tr><tr v-if="visibleTasks.length === 0"><td colspan="8" class="empty-state">没有符合条件的任务</td></tr></tbody></table></div><div class="table-footer"><span>显示最近 <b>{{ visibleTasks.length }}</b> 条任务</span><div class="pagination"><button disabled>‹</button><button class="current-page">1</button><button disabled>›</button></div></div>
+          <div class="task-table-wrap"><table class="task-table"><thead><tr><th>任务</th><th>类型</th><th>创建时间</th><th>进度</th><th>状态</th><th>错误信息</th><th>操作</th></tr></thead><tbody><tr v-for="task in visibleTasks" :key="task.id"><td><div class="task-name"><div class="task-type-icon" :class="task.mode === '指定作者' ? 'author' : task.mode === '短视频合集' ? 'collection' : ''">{{ task.mode === '指定作者' ? '◎' : task.mode === '短视频合集' ? '▤' : '▶' }}</div><div class="video-title clickable-video" role="button" tabindex="0" @click.stop="openTaskVideos(task)" @keydown.enter.stop="openTaskVideos(task)"><strong>{{ task.title }}</strong><small>{{ task.id }} · {{ task.collectedAt }}</small></div><button class="bookmark-button" :class="{ bookmarked: task.inReadingList }" :aria-label="task.inReadingList ? '取消标记' : '标记任务'" :title="task.inReadingList ? '已标记' : '标记任务'" @click.stop="toggleReading(task)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.75 4.75h10.5a1 1 0 0 1 1 1v14l-6.25-3.8-6.25 3.8v-14a1 1 0 0 1 1-1Z" /></svg></button></div></td><td><div class="author-cell">{{ task.mode }}</div></td><td class="time-cell">{{ task.createdAt || '—' }}</td><td class="metric-cell">{{ task.progress }}%</td><td>{{ task.state }}</td><td><button v-if="task.transcript" class="task-error-preview" title="点击查看完整错误" @click.stop="errorTarget = task">{{ task.transcript.length > 36 ? task.transcript.slice(0, 36) + '…' : task.transcript }}</button><span v-else>—</span></td><td><div class="row-actions"><button class="task-retry-inline" :disabled="retryingTasks.includes(task.id) || task.state === '运行中' || task.state === '待处理'" :aria-label="`重试任务 ${task.title}`" :title="task.state === '运行中' || task.state === '待处理' ? '任务正在处理中' : '在原任务上重新执行'" @click.stop="retryTask(task)"><span>↻</span><small>{{ retryingTasks.includes(task.id) ? '提交中' : '重试' }}</small></button><button class="task-delete-inline" aria-label="删除任务" title="删除任务" @click.stop="deleteTarget = task"><span>⌫</span><small>删除</small></button></div></td></tr><tr v-if="visibleTasks.length === 0"><td colspan="7" class="empty-state">没有符合条件的任务</td></tr></tbody></table></div><div class="table-footer"><span>显示最近 <b>{{ visibleTasks.length }}</b> 条任务</span><div class="pagination"><button disabled>‹</button><button class="current-page">1</button><button disabled>›</button></div></div>
         </section>
         <div class="demo-note"><span>i</span><div><strong>本机任务队列</strong><p>任务状态保存在 SQLite；服务重启后仍可查看和重试。</p></div><button @click="page = 'settings'">前往配置 <span>→</span></button></div>
       </section>
 
       <section v-else-if="page === 'videos'" class="page-content videos-page">
         <div class="page-heading"><div><div class="eyebrow">CONTENT <span>·</span> 采集结果</div><h1>采集视频</h1><p>查看视频基础信息、互动数据、处理状态和评论内容。</p></div><button class="primary-button" @click="page = 'tasks'; showCreate = true"><span>＋</span> 新建采集</button></div>
-        <section class="search-panel video-search-panel"><div class="video-search-main"><label class="search-box video-search-box"><span>⌕</span><input v-model="videoSearch.author" placeholder="作者昵称或作者 ID" @keyup.enter="refreshVideos" /></label><label class="search-box video-search-box"><span>⌕</span><input v-model="videoSearch.title" placeholder="视频标题或简介关键词" @keyup.enter="refreshVideos" /></label><div class="filter-field inline-date video-published-date"><label>视频发布时间</label><div class="range-inputs"><input id="video-published-from" v-model="videoSearch.publishedFrom" type="date" aria-label="视频发布时间开始" /><span>至</span><input v-model="videoSearch.publishedTo" type="date" aria-label="视频发布时间结束" /></div><div class="date-shortcuts"><button @click="setVideoDateRange('today')">今天</button><button @click="setVideoDateRange('yesterday')">昨天</button><button @click="setVideoDateRange('week')">近一周</button><button @click="setVideoDateRange('month')">近一月</button></div></div><button class="primary-button query-button" @click="refreshVideos">查询</button></div><div class="search-foot"><span>可按作者、视频标题和发布时间搜索</span><div><span>已找到 <b>{{ videoTotal }}</b> 条</span><button class="clear-filters" @click="resetVideoSearch">重置条件</button></div></div></section>
-        <section class="task-panel video-list-panel"><div class="task-panel-head"><div><h2>视频数据</h2><p>展示最新采集结果</p></div><span class="recent-count">{{ videoTotal }} 条记录</span></div><div class="task-table-wrap"><table class="task-table video-table"><thead><tr><th>视频</th><th>作者</th><th>发布时间</th><th>点赞</th><th>收藏</th><th>转发</th><th>处理状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="video in videos" :key="`${video.platform}-${video.video_id}`"><td><div class="collected-video"><div class="video-cover"><img v-if="video.cover_url" :src="video.cover_url" alt="" /><span v-else>{{ video.content_type === 'image' ? '▧' : '▶' }}</span></div><div><strong>{{ video.title || '标题未读取' }}</strong><small>{{ video.description || video.video_id }}</small></div></div></td><td><div class="video-author"><strong>{{ video.author_name || '未知作者' }}</strong><small>{{ video.author_id || '—' }}</small></div></td><td class="time-cell">{{ formatDateTime(video.published_at) }}</td><td class="metric-cell">{{ formatCount(video.likes) }}</td><td class="metric-cell">{{ formatCount(video.favorites) }}</td><td class="metric-cell">{{ formatCount(video.shares) }}</td><td><span class="processing-pill" :class="video.metadata_status">{{ processingLabel(video) }}</span></td><td class="time-cell">{{ formatDateTime(video.updated_at) }}</td><td><button class="detail-button" @click="openVideoDetail(video)">查看详情</button></td></tr><tr v-if="videos.length === 0"><td colspan="9" class="empty-state">暂无符合条件的视频数据</td></tr></tbody></table></div></section>
-        <section v-if="selectedVideo" class="modal-backdrop" @click.self="selectedVideo = null"><div class="create-panel video-detail-panel" role="dialog" aria-modal="true" aria-labelledby="video-detail-title"><div class="panel-heading"><div><span class="eyebrow">VIDEO DETAIL</span><h2 id="video-detail-title">{{ selectedVideo.title || '视频详情' }}</h2><p>{{ selectedVideo.author_name || '未知作者' }} · {{ formatDateTime(selectedVideo.published_at) }}</p></div><button class="close-button" aria-label="关闭" @click="selectedVideo = null">×</button></div><div class="video-detail-body"><div class="video-detail-summary"><div class="detail-cover"><img v-if="selectedVideo.cover_url" :src="selectedVideo.cover_url" alt="" /><span v-else>{{ selectedVideo.content_type === 'image' ? '▧' : '▶' }}</span></div><dl><div><dt>作者</dt><dd>{{ selectedVideo.author_name || '—' }}</dd></div><div><dt>点赞</dt><dd>{{ formatCount(selectedVideo.likes) }}</dd></div><div><dt>收藏</dt><dd>{{ formatCount(selectedVideo.favorites) }}</dd></div><div><dt>转发</dt><dd>{{ formatCount(selectedVideo.shares) }}</dd></div><div><dt>视频时长</dt><dd>{{ selectedVideo.duration_seconds ? `${selectedVideo.duration_seconds} 秒` : '—' }}</dd></div><div><dt>处理状态</dt><dd>{{ processingLabel(selectedVideo) }}</dd></div></dl></div><section class="detail-section"><h3>视频简介</h3><p>{{ selectedVideo.description || '暂无简介' }}</p><div class="tag-list"><span v-for="tag in selectedVideo.hashtags" :key="tag">#{{ tag }}</span></div></section><section class="detail-section detail-paths"><h3>文件与链接</h3><p><b>作品链接：</b><a :href="selectedVideo.url" target="_blank" rel="noreferrer">{{ selectedVideo.url }}</a></p><p><b>本地文件：</b>{{ selectedVideo.local_media_path || '未下载' }}</p></section><section v-if="selectedVideo.transcript || selectedVideo.transcript_error" class="detail-section"><h3>转写内容</h3><p>{{ selectedVideo.transcript || selectedVideo.transcript_error }}</p></section><section class="detail-section"><h3>评论内容</h3><p v-if="videoCommentsLoading" class="detail-muted">正在读取评论…</p><p v-else-if="selectedVideoComments.length === 0" class="detail-muted">暂无已采集评论</p><div v-else class="comment-list"><article v-for="comment in selectedVideoComments" :key="comment.comment_id" :class="{ reply: comment.parent_id }"><div><strong>{{ comment.author || '匿名用户' }}</strong><span>赞 {{ formatCount(comment.likes) }}</span></div><p>{{ comment.text }}</p></article></div></section></div></div></section>
+        <section class="search-panel video-search-panel"><div class="video-search-main"><div ref="authorPicker" class="author-picker" @keydown.esc.stop="authorDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="authorDropdownOpen" aria-controls="author-options-menu" @click="toggleAuthorDropdown"><span class="author-selection-text">{{ selectedAuthorNames.length ? selectedAuthorNames.join('、') : '选择作者名称（支持多选）' }}</span><span v-if="selectedAuthorNames.length" class="author-selection-count">{{ selectedAuthorNames.length }}</span><span>⌄</span></button><div v-if="authorDropdownOpen" id="author-options-menu" class="author-options-menu"><input v-model="authorSearch" class="author-options-search" aria-label="搜索作者名称" placeholder="输入作者名称模糊搜索" /><div class="author-options-toolbar"><span>已选 {{ selectedAuthorNames.length }} 位作者</span><button type="button" @click="selectedAuthorNames = []; refreshVideos()">清空</button></div><div class="author-options-list"><p v-if="authorOptionsLoading">正在加载…</p><p v-else-if="authorOptionsFailed">作者列表加载失败 <button type="button" @click="loadAuthorOptions">重试</button></p><p v-else-if="!authorOptions.length">没有匹配的作者</p><label v-for="option in authorOptionsLoading || authorOptionsFailed ? [] : authorOptions" :key="option.name"><input v-model="selectedAuthorNames" type="checkbox" :value="option.name" @change="refreshVideos" /><span>{{ option.name }}</span><small>{{ option.count }} 条</small></label></div></div></div><div ref="tagPicker" class="author-picker" @keydown.esc.stop="tagDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="tagDropdownOpen" aria-controls="tag-options-menu" @click="toggleTagDropdown"><span class="author-selection-text">{{ selectedTags.length ? selectedTags.join('、') : '选择视频标签（支持多选）' }}</span><span v-if="selectedTags.length" class="author-selection-count">{{ selectedTags.length }}</span><span>⌄</span></button><div v-if="tagDropdownOpen" id="tag-options-menu" class="author-options-menu"><input v-model="tagSearch" class="author-options-search" aria-label="搜索视频标签" placeholder="输入视频标签模糊搜索" /><div class="author-options-toolbar"><span>已选 {{ selectedTags.length }} 个标签</span><button type="button" @click="selectedTags = []; refreshVideos()">清空</button></div><div class="author-options-list"><p v-if="tagOptionsLoading">正在加载…</p><p v-else-if="tagOptionsFailed">标签列表加载失败 <button type="button" @click="loadTagOptions">重试</button></p><p v-else-if="!tagOptions.length">没有匹配的标签</p><label v-for="option in tagOptionsLoading || tagOptionsFailed ? [] : tagOptions" :key="option.name"><input v-model="selectedTags" type="checkbox" :value="option.name" @change="refreshVideos" /><span>#{{ option.name }}</span><small>{{ option.count }} 条</small></label></div></div></div><label class="search-box video-search-box"><span>⌕</span><input v-model="videoSearch.title" placeholder="视频标题或简介关键词" @keyup.enter="refreshVideos" /></label><div ref="datePicker" class="video-date-picker" @keydown.esc.stop="dateDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="dateDropdownOpen" aria-controls="video-date-menu" :title="videoDateLabel" @click="dateDropdownOpen = !dateDropdownOpen"><svg viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true"><rect x="3" y="4" width="14" height="13" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M6 2v4m8-4v4M3 9h14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><span class="author-selection-text">{{ videoDateLabel }}</span><span>⌄</span></button><div v-if="dateDropdownOpen" id="video-date-menu" class="video-date-menu"><div class="date-menu-heading"><strong>视频发布时间</strong><button type="button" @click="videoSearch.publishedFrom = ''; videoSearch.publishedTo = ''; dateDropdownOpen = false; refreshVideos()">清空</button></div><div class="date-menu-fields"><label>开始日期<input id="video-published-from" v-model="videoSearch.publishedFrom" type="date" :max="videoSearch.publishedTo || undefined" @change="refreshVideos" /></label><span>至</span><label>结束日期<input v-model="videoSearch.publishedTo" type="date" :min="videoSearch.publishedFrom || undefined" @change="refreshVideos" /></label></div><div class="date-menu-shortcuts"><button type="button" @click="setVideoDateRange('today')">今天</button><button type="button" @click="setVideoDateRange('yesterday')">昨天</button><button type="button" @click="setVideoDateRange('week')">近一周</button><button type="button" @click="setVideoDateRange('month')">近一月</button></div></div></div><button class="primary-button query-button" @click="refreshVideos">查询</button></div><div class="search-foot"><span>可按作者、标签、视频标题和发布时间搜索</span><div><span>已找到 <b>{{ videoTotal }}</b> 条</span><button class="clear-filters" @click="resetVideoSearch">重置条件</button></div></div></section>
+        <div class="author-groups-heading"><h2>按作者归类</h2><span>{{ authorVideoGroups.length }} 位作者 · {{ videoTotal }} 条视频</span></div>
+        <div v-if="!videos.length" class="task-panel empty-state">暂无符合条件的视频数据</div>
+        <details v-for="group in authorVideoGroups" :key="group.key" class="task-panel video-list-panel author-video-group" open><summary class="author-group-summary"><div class="author-group-avatar">{{ group.name.slice(0, 1) }}</div><div class="author-group-info"><h2>{{ group.name }}</h2><p>{{ group.authorId || '暂无作者 ID' }}</p></div><span class="recent-count">{{ group.videos.length }} 条视频</span><span class="author-group-chevron" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none"><path d="m6 8 4 4 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg></span></summary><div class="task-table-wrap"><table class="task-table video-table"><thead><tr><th>视频</th><th>标签</th><th>发布时间</th><th>点赞</th><th>收藏</th><th>转发</th><th>处理状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="video in group.videos" :key="`${video.platform}-${video.video_id}`"><td><div class="collected-video clickable-video" role="button" tabindex="0" @click="openVideoDetail(video)" @keydown.enter="openVideoDetail(video)"><div class="video-cover"><img v-if="video.cover_url" :src="video.cover_url" alt="" /><span v-else>{{ video.content_type === 'image' ? '▧' : '▶' }}</span></div><div><strong>{{ video.title || '标题未读取' }}</strong><small>{{ video.description || video.video_id }}</small></div></div></td><td class="video-tags-cell"><div v-if="video.hashtags.length" class="video-list-tags"><span v-for="tag in video.hashtags" :key="tag">#{{ tag }}</span></div><span v-else class="detail-muted">暂无标签</span></td><td class="time-cell">{{ formatDateTime(video.published_at) }}</td><td class="metric-cell">{{ formatCount(video.likes) }}</td><td class="metric-cell">{{ formatCount(video.favorites) }}</td><td class="metric-cell">{{ formatCount(video.shares) }}</td><td><div class="video-process-grid"><button v-for="action in videoActions" :key="action.key" class="video-process-button" :class="{ complete: videoActionDone(video, action.key), busy: videoActionBusy(video, action.key) }" :disabled="(videoActionDone(video, action.key) && action.key !== 'report') || Boolean(video.running_actions?.length) || submittingVideoActions.some((key) => key.startsWith(video.video_id + ':')) || (action.key === 'transcribe' && video.content_type === 'image')" :title="action.key === 'report' && video.report_complete ? '打开所在目录并选中报告文件' : action.key === 'transcribe' && video.content_type === 'image' ? '图文作品不支持语音转写' : videoActionDone(video, action.key) ? action.done : '点击执行：' + action.pending" @click.stop="startVideoAction(video, action.key)"><span>{{ videoActionBusy(video, action.key) ? '…' : videoActionDone(video, action.key) ? '✓' : action.icon }}</span>{{ videoActionBusy(video, action.key) ? '处理中' : action.key === 'transcribe' && video.content_type === 'image' ? '转写不适用' : videoActionDone(video, action.key) ? action.done : action.pending }}</button></div></td><td class="time-cell">{{ formatDateTime(video.updated_at) }}</td><td><div class="video-row-actions"><button class="detail-button" @click="openVideoDetail(video)">查看详情</button><button class="video-delete-button" :aria-label="`删除视频记录 ${video.title || video.video_id}`" @click.stop="deleteVideoTarget = video">删除</button></div></td></tr></tbody></table></div></details>
+        <section v-if="selectedVideo" class="modal-backdrop" @click.self="selectedVideo = null" @keydown.esc="selectedVideo = null">
+          <div class="create-panel video-detail-panel" role="dialog" aria-modal="true" aria-labelledby="video-detail-title">
+            <div class="panel-heading"><div><span class="eyebrow">VIDEO DETAIL</span><h2 id="video-detail-title">{{ selectedVideo.title || '视频详情' }}</h2></div><button class="close-button" aria-label="关闭" @click="selectedVideo = null">×</button></div>
+            <div class="video-detail-body">
+              <div class="detail-player">
+                <video v-if="selectedVideo.download_complete && selectedVideo.content_type !== 'image'" :key="selectedVideo.video_id" controls playsinline preload="metadata" :poster="selectedVideo.cover_url || undefined" :src="`${API_BASE}/api/videos/${encodeURIComponent(selectedVideo.platform)}/${encodeURIComponent(selectedVideo.video_id)}/media`" @error="videoPlaybackError = true">浏览器不支持视频播放。</video>
+                <div v-else class="detail-player-empty"><img v-if="selectedVideo.cover_url" :src="selectedVideo.cover_url" alt="作品封面" /><p>{{ selectedVideo.content_type === 'image' ? '图文作品暂无视频可播放' : '视频尚未下载' }}</p><button v-if="selectedVideo.content_type !== 'image'" class="secondary-button" :disabled="Boolean(selectedVideo.running_actions?.length)" @click="startVideoAction(selectedVideo, 'download')">下载视频</button></div>
+              </div>
+              <p v-if="videoPlaybackError" class="playback-error">视频加载失败，请确认本地文件仍存在且浏览器支持该视频格式。</p>
+              <div class="detail-reading-grid">
+                <section class="detail-section transcript-section"><h3>转写文字</h3><p v-if="selectedVideo.transcript">{{ selectedVideo.transcript }}</p><p v-else class="detail-muted">暂无转写文字</p><p v-if="selectedVideo.transcript_error" class="playback-error">{{ selectedVideo.transcript_error }}</p></section>
+                <section class="detail-section"><div class="comment-section-heading"><h3>评论 <span class="detail-muted">{{ selectedVideoComments.length }} 条</span></h3><button type="button" class="marked-comments-filter" :class="{ active: markedCommentsOnly }" :aria-pressed="markedCommentsOnly" @click="markedCommentsOnly = !markedCommentsOnly">{{ markedCommentsOnly ? '查看全部评论' : '只看已标记' }}<span>{{ markedCommentCount }}</span></button></div><p v-if="videoCommentsLoading" class="detail-muted">正在读取评论…</p><p v-else-if="visibleVideoComments.length === 0" class="detail-muted">{{ markedCommentsOnly ? '暂无已标记评论' : '暂无已采集评论' }}</p><div v-else class="comment-list"><article v-for="comment in visibleVideoComments" :key="comment.comment_id" :class="{ reply: comment.parent_id, marked: comment.marked }"><div><strong>{{ comment.author || '匿名用户' }}</strong><div class="comment-meta-actions"><span>赞 {{ formatCount(comment.likes) }}</span><button type="button" class="comment-mark-button" :class="{ active: comment.marked }" :aria-pressed="comment.marked" :disabled="markingComments.includes(comment.comment_id)" @click="toggleCommentMark(comment)">{{ markingComments.includes(comment.comment_id) ? '保存中…' : comment.marked ? '★ 已标记' : '☆ 标记' }}</button></div></div><p>{{ comment.text }}</p></article></div></section>
+              </div>
+              <details class="detail-extra" :key="selectedVideo.video_id"><summary>其他信息 · 简介、作者、互动数据及文件</summary><div class="video-detail-summary"><dl><div><dt>作者</dt><dd>{{ selectedVideo.author_name || '—' }}</dd></div><div><dt>发布时间</dt><dd>{{ formatDateTime(selectedVideo.published_at) }}</dd></div><div><dt>视频时长</dt><dd>{{ selectedVideo.duration_seconds ? `${selectedVideo.duration_seconds} 秒` : '—' }}</dd></div><div><dt>点赞 / 收藏 / 转发</dt><dd>{{ formatCount(selectedVideo.likes) }} / {{ formatCount(selectedVideo.favorites) }} / {{ formatCount(selectedVideo.shares) }}</dd></div><div><dt>处理状态</dt><dd>{{ processingLabel(selectedVideo) }}</dd></div></dl></div><section class="detail-section"><h3>视频简介</h3><p>{{ selectedVideo.description || '暂无简介' }}</p><div class="tag-list"><span v-for="tag in selectedVideo.hashtags" :key="tag">#{{ tag }}</span></div></section><section class="detail-section detail-paths"><h3>文件与链接</h3><p><b>作品链接：</b><a :href="selectedVideo.url" target="_blank" rel="noreferrer">{{ selectedVideo.url }}</a></p><p><b>本地文件：</b>{{ selectedVideo.local_media_path || '未下载' }}</p></section></details>
+            </div>
+          </div>
+        </section>
       </section>
 
-      <section v-else class="page-content settings-page">
+      <div v-if="deleteVideoTarget" class="modal-backdrop confirm-backdrop" @click.self="deleteVideoTarget = null"><section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-video-title"><div class="confirm-icon">!</div><h2 id="delete-video-title">删除这条视频记录？</h2><p>“{{ deleteVideoTarget.title || deleteVideoTarget.video_id }}”及其关联的评论和转写分段会被删除，任务记录不受影响。</p><div class="confirm-actions"><button class="secondary-button" @click="deleteVideoTarget = null">取消</button><button class="danger-button" @click="confirmDeleteVideo">确认删除</button></div></section></div>
+      <section v-if="page === 'settings'" class="page-content settings-page">
         <div class="page-heading"><div><div class="eyebrow">PREFERENCES <span>·</span> 配置管理</div><h1>采集配置</h1><p>按功能管理所有运行参数，新建任务时可作为默认配置使用。</p></div><div class="heading-actions"><button class="secondary-button" @click="resetSettings">恢复默认</button><button class="primary-button" @click="saveSettings">保存配置 <span>✓</span></button></div></div>
         <div class="settings-layout"><aside class="settings-nav"><div class="settings-nav-title">配置分区 <span>{{ groups.length }}</span></div><button v-for="group in groups" :key="group.id" class="settings-nav-item" :class="{ selected: settingsGroup === group.id }" @click="settingsGroup = group.id"><span class="group-icon">{{ group.icon }}</span><span class="group-copy"><strong>{{ group.label }}</strong><small>{{ group.caption }}</small></span><span v-if="settingsGroup === group.id" class="nav-current"></span></button><div class="coverage-note"><span>✓</span><div><strong>配置项已覆盖</strong><small>{{ settingCount }} 项 · 与示例配置对应</small></div></div></aside>
-          <div class="settings-content"><div class="settings-content-head"><div><div class="eyebrow">CONFIGURATION</div><h2>{{ activeGroup.label }}</h2><p>{{ activeGroup.caption }}<span class="config-count">{{ visibleSettings.length }} 项配置</span></p></div><label class="search-box settings-search"><span>⌕</span><input v-model="settingsSearch" placeholder="搜索当前分区" /></label></div><div class="settings-card"><div v-for="item in visibleSettings" :key="item.key" class="setting-row" :class="{ 'textarea-row': item.kind === 'textarea' }"><div class="setting-info"><label :for="item.key">{{ item.label }}</label><small>{{ item.description }}</small></div><div class="setting-control" :class="{ 'toggle-control': item.kind === 'toggle' }"><textarea v-if="item.kind === 'textarea'" :id="item.key" :value="stringValue(item.key)" rows="3" placeholder="每行一个链接，可留空" @input="setStringValue(item.key, $event)"></textarea><div v-else-if="item.kind === 'secret'" class="secret-input"><input :id="item.key" :value="stringValue(item.key)" :type="revealKey ? 'text' : 'password'" :placeholder="secretConfigured ? '已配置；留空表示保持不变' : '填写 MiMo API Key'" @input="setStringValue(item.key, $event)" /><button @click="revealKey = !revealKey">{{ revealKey ? '隐藏' : '显示' }}</button></div><select v-else-if="item.kind === 'select'" :id="item.key" :value="stringValue(item.key)" @change="setStringValue(item.key, $event)"><option v-for="option in item.options" :key="option" :value="option">{{ option }}</option></select><button v-else-if="item.kind === 'toggle'" :id="item.key" class="switch" :class="{ on: config[item.key] }" role="switch" :aria-checked="Boolean(config[item.key])" @click="config[item.key] = !config[item.key]"><span></span></button><div v-else class="value-input"><input :id="item.key" :value="stringValue(item.key)" :type="item.kind === 'number' ? 'number' : 'text'" :placeholder="item.kind === 'number' ? '不限制' : ''" @input="setStringValue(item.key, $event)" /><span v-if="item.unit">{{ item.unit }}</span></div><code>{{ item.key }}</code></div></div><div v-if="visibleSettings.length === 0" class="empty-settings">没有找到匹配的配置项</div></div><div class="settings-tip"><span>i</span><p>配置从本机后端读取，保存前会校验；已设置的 API Key 留空时会继续保留。</p></div></div>
+          <div class="settings-content"><div class="settings-content-head"><div><div class="eyebrow">CONFIGURATION</div><h2>{{ activeGroup.label }}</h2><p>{{ activeGroup.caption }}<span class="config-count">{{ visibleSettings.length }} 项配置</span></p></div><label class="search-box settings-search"><span>⌕</span><input v-model="settingsSearch" placeholder="搜索当前分区" /></label></div><div class="settings-card"><div v-for="item in visibleSettings" :key="item.key" class="setting-row" :class="{ 'textarea-row': item.kind === 'textarea' }"><div class="setting-info"><label :for="item.key">{{ item.label }}</label><small>{{ item.description }}</small></div><div class="setting-control" :class="{ 'toggle-control': item.kind === 'toggle' }"><textarea v-if="item.kind === 'textarea'" :id="item.key" :value="stringValue(item.key)" rows="3" placeholder="每行一个链接，可留空" @input="setStringValue(item.key, $event)"></textarea><div v-else-if="item.kind === 'secret'" class="secret-field"><span class="secret-status" :class="{ configured: secretConfigured }" role="status">{{ secretConfigured ? '✓ 已配置' : '未配置' }}<small v-if="stringValue(item.key)"> · 保存后更新</small></span><div class="secret-input"><input :id="item.key" :value="stringValue(item.key)" :type="revealKey ? 'text' : 'password'" :placeholder="secretConfigured ? '已配置；留空表示保持不变' : '填写 MiMo API Key'" @input="setStringValue(item.key, $event)" /><button type="button" :disabled="keyLoading || (!secretConfigured && !stringValue(item.key))" @click="toggleApiKey">{{ keyLoading ? '读取中…' : revealKey ? '隐藏' : '查看' }}</button></div></div><select v-else-if="item.kind === 'select'" :id="item.key" :value="stringValue(item.key)" @change="setStringValue(item.key, $event)"><option v-for="option in item.options" :key="option" :value="option">{{ option }}</option></select><button v-else-if="item.kind === 'toggle'" :id="item.key" class="switch" :class="{ on: config[item.key] }" role="switch" :aria-checked="Boolean(config[item.key])" @click="config[item.key] = !config[item.key]"><span></span></button><div v-else class="value-input"><input :id="item.key" :value="stringValue(item.key)" :type="item.kind === 'number' ? 'number' : 'text'" :placeholder="item.kind === 'number' ? '不限制' : ''" @input="setStringValue(item.key, $event)" /><span v-if="item.unit">{{ item.unit }}</span></div><code>{{ item.key }}</code></div></div><div v-if="visibleSettings.length === 0" class="empty-settings">没有找到匹配的配置项</div></div><div class="settings-tip"><span>i</span><p>配置从本机后端读取，保存前会校验；已设置的 API Key 留空时会继续保留。</p></div></div>
         </div>
       </section>
     </main>
-    <div v-if="deleteTarget" class="modal-backdrop confirm-backdrop" @click.self="deleteTarget = null"><section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title"><div class="confirm-icon">!</div><h2 id="delete-title">删除这条任务记录？</h2><p>“{{ deleteTarget.title }}”将从任务列表移除，已经采集的视频、评论和报告仍会保留。</p><div class="confirm-actions"><button class="secondary-button" @click="deleteTarget = null">取消</button><button class="danger-button" @click="confirmDelete">确认删除</button></div></section></div>
+    <div v-if="errorTarget" class="modal-backdrop confirm-backdrop" @click.self="errorTarget = null" @keydown.esc="errorTarget = null"><section class="confirm-dialog error-dialog" role="dialog" aria-modal="true" aria-labelledby="task-error-title"><div class="panel-heading"><h2 id="task-error-title">任务错误详情</h2><button class="close-button" aria-label="关闭错误详情" autofocus @click="errorTarget = null">×</button></div><p>{{ errorTarget.title }}</p><pre class="task-error-full">{{ errorTarget.transcript }}</pre><button class="secondary-button" @click="errorTarget = null">关闭</button></section></div>
+      <div v-if="deleteTarget" class="modal-backdrop confirm-backdrop" @click.self="deleteTarget = null"><section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title"><div class="confirm-icon">!</div><h2 id="delete-title">删除这条任务记录？</h2><p>“{{ deleteTarget.title }}”将从任务列表移除，已经采集的视频、评论和报告仍会保留。</p><div class="confirm-actions"><button class="secondary-button" @click="deleteTarget = null">取消</button><button class="danger-button" @click="confirmDelete">确认删除</button></div></section></div>
     <Transition name="toast"><div v-if="toast" class="toast-message"><span>✓</span>{{ toast }}</div></Transition>
   </div>
 </template>
