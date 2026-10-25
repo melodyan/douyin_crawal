@@ -724,6 +724,33 @@ class CoreTests(unittest.TestCase):
             transcriber.return_value.transcribe.assert_called_once()
             self.assertIn("强制重跑视频 123", "\n".join(logs.output))
 
+    def test_incremental_update_rediscovers_and_only_processes_missing_videos(self):
+        for source in ("https://www.douyin.com/user/author", "https://www.douyin.com/collection/999"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                config = load_config(DEFAULT_FILE)
+                config["runtime"]["state_db"] = Path(directory) / "state.sqlite3"
+                config["inputs"]["max_videos_per_profile"] = 3
+                config["inputs"]["max_videos_per_collection"] = 3
+                urls = [f"https://www.douyin.com/video/{i}" for i in range(1, 6)]
+                store = Store(config["runtime"]["state_db"])
+                for i in range(1, 4):
+                    store.save_video(Video("douyin", str(i), urls[i-1], transcript_status="failed"))
+                store.save_discovery("douyin", "https://www.douyin.com/user/author",
+                                     Discovery(urls[:3], True, "旧列表完整", "author"))
+                store.close()
+                adapter = Mock()
+                adapter.discover.return_value = Discovery(urls, True, "到底", "author")
+                adapter.discover_collection.return_value = Collection("999", source, video_urls=urls, complete=True)
+                with patch("video_tool.pipeline.DouyinAdapter", return_value=adapter), \
+                     patch("video_tool.pipeline._process_video", return_value=True) as process:
+                    status = {}
+                    collect_or_run(config, [source], True, status, generate_reports=False, update_only=True)
+                self.assertEqual([call.args[2] for call in process.call_args_list], urls[3:])
+                self.assertEqual(status["failed"], 0)
+                if "/user/" in source:
+                    adapter.discover.assert_called_once()
+                    self.assertIsNone(adapter.discover.call_args.args[1])
+
     def test_run_generates_reports_only_for_current_input(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

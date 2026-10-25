@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,6 +25,29 @@ class ApiTests(unittest.TestCase):
         root = Path(directory)
         (root / "config.yaml.bak").write_text(DEFAULT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
         return root
+
+    def test_queued_tasks_do_not_execute_together(self):
+        started = threading.Event()
+        release = threading.Event()
+        executed = []
+        def work(task_id, request, config):
+            executed.append(task_id)
+            if task_id == "first":
+                started.set()
+                release.wait(3)
+        with patch.object(api, "_run_task", side_effect=work):
+            first = threading.Thread(target=api._run_queued_task, args=("first", None, {}))
+            second = threading.Thread(target=api._run_queued_task, args=("second", None, {}))
+            first.start()
+            self.assertTrue(started.wait(2))
+            try:
+                second.start()
+                self.assertEqual(executed, ["first"])
+            finally:
+                release.set()
+                first.join(3)
+                second.join(3)
+            self.assertEqual(executed, ["first", "second"])
 
     def test_tasks_are_persisted_and_recovered_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -74,6 +98,28 @@ class ApiTests(unittest.TestCase):
                 self.assertTrue(all(value == "pending" for value in task["steps"].values()))
                 self.assertEqual(client.get("/api/tasks").json()["data"]["total"], 1)
                 self.assertEqual(client.post(f"/api/tasks/{task_id}/retry").status_code, 409)
+
+    def test_update_reuses_collection_task_without_force_reprocess(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root), patch.object(api.threading, "Thread"):
+                client = TestClient(api.app)
+                task = client.post("/api/tasks", json={"mode": "collect",
+                    "urls": ["https://www.douyin.com/collection/999"],
+                    "options": {"force_reprocess": True}}).json()["data"]
+                url = f"/api/tasks/{task['id']}/update"
+                self.assertEqual(client.post(url).status_code, 409)
+                api.CANCEL_EVENTS.clear()
+                response = client.post(url)
+                self.assertEqual(response.status_code, 202, response.text)
+                updated = response.json()["data"]
+                self.assertEqual(updated["id"], task["id"])
+                self.assertTrue(updated["options"]["update_only"])
+                self.assertFalse(updated["options"]["force_reprocess"])
+                self.assertEqual(client.get("/api/tasks").json()["data"]["total"], 1)
+                api.CANCEL_EVENTS.clear()
+                retried = client.post(f"/api/tasks/{task['id']}/retry").json()["data"]
+                self.assertNotIn("update_only", retried["options"])
 
     def test_worker_updates_persisted_steps_and_completion(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -258,6 +304,38 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(client.get(url).status_code, 404)
                 self.assertEqual(client.get("/api/videos/douyin/missing/media").status_code, 404)
 
+    def test_refresh_video_updates_metrics_and_comments_preserves_assets_and_marks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root):
+                config = api._config()
+                store = api._store(config)
+                old = Video("douyin", "123", "https://www.douyin.com/video/123", title="原标题",
+                            local_media_path=str(root / "video.mp4"), transcript_status="complete",
+                            transcript="保留转写", likes=1)
+                store.save_video(old)
+                store.save_comments("douyin", "123", CommentResult([Comment("1", "旧评论")], True, "到底"))
+                store.mark_comment("douyin", "123", "1", True)
+                store.close()
+                fresh = Video("douyin", "123", old.url, metadata_status="complete", likes=20, favorites=10,
+                              shares=5, description="最新简介 #ai")
+                with patch.object(api, "DouyinAdapter") as adapter:
+                    adapter.return_value.read_video.return_value = fresh
+                    adapter.return_value.read_comments.return_value = CommentResult(
+                        [Comment("1", "旧评论", likes=8), Comment("2", "新评论")], True, "到底")
+                    api._execute_video_action(config, "123", "refresh")
+                store = api._store(config)
+                saved = store.get_video("douyin", "123")
+                self.assertEqual((saved.likes, saved.favorites, saved.shares), (20, 10, 5))
+                self.assertEqual(saved.local_media_path, old.local_media_path)
+                self.assertEqual(saved.transcript, "保留转写")
+                self.assertEqual(saved.transcript_status, "complete")
+                self.assertEqual(saved.title, "原标题")
+                self.assertEqual(len(store.comments("douyin", "123")), 2)
+                self.assertEqual(store.marked_comments("douyin", "123"), {"1"})
+                store.close()
+                adapter.return_value.close.assert_called_once()
+
     def test_video_status_and_individual_actions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._root(directory)
@@ -275,7 +353,7 @@ class ApiTests(unittest.TestCase):
                 self.assertTrue(listing["download_complete"])
                 self.assertTrue(listing["comments_complete"])
                 self.assertFalse(listing["report_complete"])
-                for action in ("download", "comments", "transcribe", "report"):
+                for action in ("download", "comments", "transcribe", "report", "refresh"):
                     api.CANCEL_EVENTS.clear()
                     response = client.post(f"/api/videos/douyin/123/actions/{action}")
                     self.assertEqual(response.status_code, 202, response.text)
@@ -285,6 +363,7 @@ class ApiTests(unittest.TestCase):
                     self.assertIn(action, listing["running_actions"])
                     duplicate = client.post(f"/api/videos/douyin/123/actions/{action}")
                     self.assertEqual(duplicate.status_code, 409)
+                    self.assertEqual(client.delete("/api/videos/douyin/123").status_code, 409)
                     with patch.object(api, "_execute_video_action") as execute:
                         api._run_task(task["id"], api.TaskRequest(mode=task["mode"], urls=task["urls"],
                                       options=task["options"]), api._config())

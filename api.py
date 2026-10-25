@@ -25,13 +25,14 @@ from video_tool.reporter import generate
 from video_tool.transcriber import Transcriber
 from video_tool.platforms.douyin import DouyinAdapter
 from video_tool.pipeline import download_one
-from video_tool.platforms.douyin import HASHTAG_RE, collection_id, video_id
+from video_tool.platforms.douyin import HASHTAG_RE, collection_id, is_profile, video_id
 
 ROOT = Path(__file__).resolve().parent
 DEFAULTS = yaml.safe_load(DEFAULT_FILE.read_text(encoding="utf-8"))
 CANCEL_EVENTS: dict[str, threading.Event] = {}
 TASK_LOCK = threading.Lock()
 RETRY_LOCK = threading.Lock()
+EXECUTION_LOCK = threading.Lock()
 
 app = FastAPI(title="Douyin Crawler API", version="0.2.0")
 app.add_middleware(
@@ -146,10 +147,13 @@ def _run_task(task_id: str, request: TaskRequest, config: dict):
         _task_options(config, request.options)
         if request.options.get("video_action"):
             action = request.options["video_action"]
-            progress(action, 10)
+            step = "collect" if action == "refresh" else action
+            progress(step, 10)
             _execute_video_action(config, request.options["video_id"], action)
             task = _get_task(task_id, config)
-            task["steps"][action] = "done"
+            task["steps"][step] = "done"
+            if action == "refresh":
+                task["steps"]["comments"] = "done"
             task.update(state="done", progress=100, error="")
             return
         if local_video_path:
@@ -179,6 +183,7 @@ def _run_task(task_id: str, request: TaskRequest, config: dict):
             transcribe_media=selected["transcribe"],
             retain_download=selected["download"],
             generate_reports=selected["report"],
+            update_only=bool(request.options.get("update_only")),
         )
         task = _get_task(task_id, config)
         relevant = [name for name in ["collect", "comments", "download", "transcribe", "report"]
@@ -218,6 +223,12 @@ def _run_task(task_id: str, request: TaskRequest, config: dict):
         task["finished_at"] = _now()
         _save_task(task, config)
         CANCEL_EVENTS.pop(task_id, None)
+
+
+def _run_queued_task(task_id: str, request: TaskRequest, config: dict):
+    # Browser tasks share one persistent profile and must not launch together.
+    with EXECUTION_LOCK:
+        _run_task(task_id, request, config)
 
 
 def _create_task(request: TaskRequest, existing: dict | None = None) -> dict:
@@ -263,7 +274,7 @@ def _create_task(request: TaskRequest, existing: dict | None = None) -> dict:
     }
     _save_task(task, config)
     CANCEL_EVENTS[task_id] = threading.Event()
-    threading.Thread(target=_run_task, args=(task_id, request, config), daemon=True).start()
+    threading.Thread(target=_run_queued_task, args=(task_id, request, config), daemon=True).start()
     return task
 
 
@@ -382,9 +393,27 @@ def retry_task(task_id: str):
             raise HTTPException(409, "任务仍在处理中，请等待任务停止后重试")
         options = dict(old.get("options", {}))
         options["force_reprocess"] = True
+        options.pop("update_only", None)
         try:
             return {"data": _create_task(TaskRequest(
                 mode=old["mode"], urls=old.get("urls", []), options=options), existing=old)}
+        except (OSError, TypeError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/tasks/{task_id}/update", status_code=202)
+def update_task(task_id: str):
+    with RETRY_LOCK:
+        old = _get_task(task_id)
+        if task_id in CANCEL_EVENTS:
+            raise HTTPException(409, "任务仍在处理中，请等待任务停止后更新")
+        urls = old.get("urls", [])
+        if not urls or any(not (is_profile(url) or collection_id(url)) for url in urls):
+            raise HTTPException(422, "仅作者和合集采集任务支持增量更新")
+        options = dict(old.get("options", {}))
+        options.update(update_only=True, force_reprocess=False, refresh_completed=False)
+        try:
+            return {"data": _create_task(TaskRequest(mode=old["mode"], urls=urls, options=options), existing=old)}
         except (OSError, TypeError, ValueError) as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -505,7 +534,23 @@ def _execute_video_action(config: dict, identifier: str, action: str):
         video = store.get_video("douyin", identifier)
         if not video:
             raise ValueError("视频记录不存在")
-        if action == "download":
+        if action == "refresh":
+            adapter = DouyinAdapter(config["browser"], config["crawl"])
+            try:
+                fresh = adapter.read_video(video.url)
+                if fresh.video_id != identifier or fresh.metadata_status != "complete":
+                    raise RuntimeError(fresh.metadata_error or "未能完整读取该视频的最新信息")
+                for field in ("likes", "favorites", "shares", "description", "hashtags", "tags_status",
+                              "cover_url", "published_at", "duration_seconds"):
+                    setattr(video, field, getattr(fresh, field))
+                store.save_video(video)
+                result = adapter.read_comments(fresh, config["crawl"]["max_comments_per_video"])
+                store.save_comments(video.platform, identifier, result, replace=result.complete)
+                if not result.complete:
+                    raise RuntimeError(f"互动数据已更新，但评论采集未完成：{result.stop_reason}")
+            finally:
+                adapter.close()
+        elif action == "download":
             video.local_media_path = str(download_one(config, video.url).resolve())
             store.save_video(video)
         elif action == "comments":
@@ -546,7 +591,7 @@ def _execute_video_action(config: dict, identifier: str, action: str):
 
 @app.post("/api/videos/{platform}/{identifier}/actions/{action}", status_code=202)
 def start_video_action(platform: str, identifier: str, action: str):
-    if platform != "douyin" or action not in {"download", "comments", "transcribe", "report"}:
+    if platform != "douyin" or action not in {"download", "comments", "transcribe", "report", "refresh"}:
         raise HTTPException(422, "不支持的流程")
     with RETRY_LOCK:
         config = _config()
@@ -563,9 +608,10 @@ def start_video_action(platform: str, identifier: str, action: str):
                 raise HTTPException(422, "图文作品不支持语音转写")
             if action == "transcribe" and (not video.local_media_path or not Path(video.local_media_path).is_file()):
                 raise HTTPException(422, "请先下载视频，再执行转写")
-            options = dict(video_action=action, video_id=identifier, title=f"{video.title or identifier} · {action}",
+            label = "更新互动数据及评论" if action == "refresh" else action
+            options = dict(video_action=action, video_id=identifier, title=f"{video.title or identifier} · {label}",
                            download_video=False, transcribe_text=False, include_comments=False, generate_report=False)
-            options[{"download": "download_video", "comments": "include_comments", "transcribe": "transcribe_text", "report": "generate_report"}[action]] = True
+            options[{"download": "download_video", "comments": "include_comments", "transcribe": "transcribe_text", "report": "generate_report", "refresh": "include_comments"}[action]] = True
             return {"data": _create_task(TaskRequest(mode="collect", urls=[video.url], options=options))}
         except (OSError, TypeError, ValueError) as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -575,8 +621,13 @@ def start_video_action(platform: str, identifier: str, action: str):
 
 @app.delete("/api/videos/{platform}/{video_id}")
 def delete_video(platform: str, video_id: str):
+    from video_tool.platforms.douyin import video_id as extract_video_id
     store = _store()
     try:
+        for task in store.all_tasks():
+            if task["id"] in CANCEL_EVENTS and (task.get("options", {}).get("video_id") == video_id
+                    or any(video_id == extract_video_id(url) for url in task.get("urls", []))):
+                raise HTTPException(409, "该视频仍有流程运行，请等待任务结束后删除")
         store.delete_video(platform, video_id)
         return {"data": {"deleted": True}}
     finally:

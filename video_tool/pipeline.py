@@ -256,7 +256,8 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict | Non
                    on_progress: Callable[[str, int], None] | None = None,
                    transcribe_media: bool | None = None,
                    retain_download: bool = False,
-                   generate_reports: bool | None = None) -> list[Path]:
+                   generate_reports: bool | None = None,
+                   update_only: bool = False) -> list[Path]:
     if transcribe_media is None:
         transcribe_media = full
     if generate_reports is None:
@@ -294,15 +295,15 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict | Non
                              len(discovery.video_urls), "完整" if discovery.complete else "未确认完整",
                              discovery.stop_reason)
                     limit = config["inputs"]["max_videos_per_collection"]
-                    targets = discovery.video_urls[:limit] if limit is not None else discovery.video_urls
+                    targets = discovery.video_urls if update_only else discovery.video_urls[:limit] if limit is not None else discovery.video_urls
                 elif profile:
                     active_profile_urls.add(resolved)
                     previous = store.get_discovery("douyin", resolved) if config["crawl"]["resume"] else None
-                    if previous and previous.complete and not config["crawl"]["refresh_completed"]:
+                    if previous and previous.complete and not config["crawl"]["refresh_completed"] and not update_only:
                         discovery = previous
                     else:
                         discovery = adapter.discover(
-                            resolved, config["inputs"]["max_videos_per_profile"], previous,
+                            resolved, None if update_only else config["inputs"]["max_videos_per_profile"], previous,
                             on_progress=lambda partial: (_checkpoint(cancel_requested),
                                                          store.save_discovery("douyin", resolved, partial))[-1])
                     store.save_discovery("douyin", resolved, discovery)
@@ -314,6 +315,9 @@ def collect_or_run(config: dict, urls: list[str], full: bool, status: dict | Non
                 for target in targets:
                     _checkpoint(cancel_requested)
                     identifier = video_id(target)
+                    if update_only and identifier and store.get_video("douyin", identifier) is not None:
+                        LOG.info("增量更新：视频 %s 已在库，跳过", identifier)
+                        continue
                     if identifier:
                         active_video_ids.add(identifier)
                     if not _process_video(adapter, store, target, config, full, include_comments,
