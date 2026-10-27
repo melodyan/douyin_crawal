@@ -4,10 +4,12 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 type Page = 'overview' | 'tasks' | 'videos' | 'settings'
 type TaskMode = 'video' | 'collection' | 'author'
 type TaskModule = 'download' | 'transcribe' | 'comments' | 'report'
-type TaskState = '运行中' | '已完成' | '待处理' | '失败' | '已取消'
+type TaskState = '已暂停' | '运行中' | '已完成' | '待处理' | '失败' | '已取消'
 type TranscriptState = '未转写' | '转写中' | '已转写'
 type CommentsState = '未采集' | '采集中' | '已采集'
 interface Task {
+  requestMode: string
+  options: Record<string, any>
   id: string
   title: string
   mode: string
@@ -60,6 +62,13 @@ interface CollectedVideo {
 
 interface VideoComment { marked: boolean; comment_id: string; text: string; likes: number; author: string; parent_id: string; reply_to_id: string; author_id: string; published_at: string }
 
+function readSearch(key: string): Record<string, any> {
+  try { const value = JSON.parse(localStorage.getItem(key) || '{}'); return value && typeof value === 'object' && !Array.isArray(value) ? value : {} } catch { return {} }
+}
+function searchText(value: unknown, fallback = '') { return typeof value === 'string' ? value : fallback }
+function searchList(value: unknown): string[] { return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : [] }
+const savedTasks = readSearch('douyin-task-search-v1')
+const savedVideos = readSearch('douyin-video-search-v1')
 const storedPage = localStorage.getItem('douyin-current-page')
 const page = ref<Page>(storedPage === 'overview' || storedPage === 'tasks' || storedPage === 'videos' || storedPage === 'settings' ? storedPage : 'tasks')
 const toast = ref('')
@@ -69,12 +78,39 @@ const activeModules = ref<TaskModule[]>(['download', 'transcribe', 'comments', '
 const taskName = ref('')
 const sourceUrl = ref('')
 const tempConfig = ref(false)
-const selectedSettings = ref(['crawl.max_comments_per_video', 'inputs.max_videos_per_profile'])
+const selectedSettings = ref<string[]>([])
+const taskConfigOptions = [
+  { key: 'crawl.max_comments_per_video', option: 'max_comments_per_video', label: '单视频评论上限', kind: 'number' },
+  { key: 'inputs.max_videos_per_profile', option: 'max_videos_per_profile', label: '作者作品上限', kind: 'number' },
+  { key: 'inputs.max_videos_per_collection', option: 'max_videos_per_collection', label: '合集作品上限', kind: 'number' },
+  { key: 'crawl.refresh_completed', option: 'force_reprocess', label: '重新处理已完成作品', kind: 'toggle' },
+]
+const taskConfig = reactive<Record<string, string | number | boolean>>({})
 const settingsGroup = ref('inputs')
 const revealKey = ref(false)
 const secretConfigured = ref(false)
-const taskFilter = ref('全部任务')
-const appliedTaskFilter = ref('全部任务')
+const taskFilter = ref(searchText(savedTasks.status, '全部任务'))
+const taskStatusOpen = ref(false)
+const taskStatusPicker = ref<HTMLElement | null>(null)
+const taskStatusOptions = [
+  { label: '全部任务', tone: 'all' }, { label: '运行中', tone: 'running' },
+  { label: '已完成', tone: 'done' }, { label: '待处理', tone: 'pending' },
+  { label: '已暂停', tone: 'pending' }, { label: '失败', tone: 'failed' }, { label: '已取消', tone: 'cancelled' },
+]
+function closeTaskStatus(event: MouseEvent) {
+  if (taskStatusPicker.value && !taskStatusPicker.value.contains(event.target as Node)) taskStatusOpen.value = false
+}
+function chooseTaskStatus(label: string) { taskFilter.value = label; taskStatusOpen.value = false; applyFilters() }
+function moveTaskStatus(event: KeyboardEvent) {
+  const step = event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0
+  if (!step) return
+  event.preventDefault()
+  const buttons = taskStatusPicker.value?.querySelectorAll<HTMLButtonElement>('[role=option]')
+  if (!buttons?.length) { taskStatusOpen.value = true; return }
+  const index = [...buttons].indexOf(document.activeElement as HTMLButtonElement)
+  buttons[(index + step + buttons.length) % buttons.length]?.focus()
+}
+const appliedTaskFilter = ref(taskFilter.value)
 const deleteTarget = ref<Task | null>(null)
 const errorTarget = ref<Task | null>(null)
 const videos = ref<CollectedVideo[]>([])
@@ -92,8 +128,8 @@ const authorVideoGroups = computed(() => {
   }
   return [...groups.values()]
 })
-const videoSearch = reactive({ title: '', publishedFrom: '', publishedTo: '' })
-const selectedAuthorNames = ref<string[]>([])
+const videoSearch = reactive({ title: searchText(savedVideos.title), publishedFrom: searchText(savedVideos.publishedFrom, localDate(-6)), publishedTo: searchText(savedVideos.publishedTo, localDate()) })
+const selectedAuthorNames = ref<string[]>(searchList(savedVideos.authors))
 const authorOptions = ref<{ name: string; count: number }[]>([])
 const authorSearch = ref('')
 const authorDropdownOpen = ref(false)
@@ -120,7 +156,7 @@ function closeAuthorDropdown(event: MouseEvent) {
   if (authorPicker.value && !authorPicker.value.contains(event.target as Node)) authorDropdownOpen.value = false
 }
 watch(authorSearch, () => { clearTimeout(authorSearchTimer); authorSearchTimer = setTimeout(loadAuthorOptions, 200) })
-const selectedTags = ref<string[]>([])
+const selectedTags = ref<string[]>(searchList(savedVideos.tags))
 const tagOptions = ref<{ name: string; count: number }[]>([])
 const tagSearch = ref('')
 const tagDropdownOpen = ref(false)
@@ -162,12 +198,15 @@ const datePicker = ref<HTMLElement | null>(null)
 const videoDateLabel = computed(() => {
   const from = videoSearch.publishedFrom
   const to = videoSearch.publishedTo
-  return from && to ? `${from} 至 ${to}` : from ? `${from} 起` : to ? `截至 ${to}` : '视频发布时间'
+  return from && to ? `${from} 至 ${to}` : from ? `${from} 起` : to ? `截至 ${to}` : '全部发布时间'
 })
 function closeDateDropdown(event: MouseEvent) {
   if (datePicker.value && !datePicker.value.contains(event.target as Node)) dateDropdownOpen.value = false
 }
-const videoSourceUrl = ref('')
+const videoSourceUrl = ref(searchText(savedVideos.sourceUrl))
+let videoRequestVersion = 0
+const videosLoading = ref(false)
+const videoLoadError = ref('')
 const selectedVideo = ref<CollectedVideo | null>(null)
 const deleteVideoTarget = ref<CollectedVideo | null>(null)
 const selectedVideoComments = ref<VideoComment[]>([])
@@ -187,8 +226,8 @@ async function toggleCommentMark(comment: VideoComment) {
 }
 const videoCommentsLoading = ref(false)
 const videoPlaybackError = ref(false)
-function localDate(offsetDays = 0) { const date = new Date(); date.setDate(date.getDate() + offsetDays); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}` }
-const filters = reactive({ videoName: '', collectedFrom: localDate(), collectedTo: localDate() })
+function localDate(offsetDays = 0) { return dateInShanghai(new Date(Date.now() + offsetDays * 86400000).toISOString()) }
+const filters = reactive({ videoName: searchText(savedTasks.videoName), collectedFrom: searchText(savedTasks.collectedFrom, localDate(-6)), collectedTo: searchText(savedTasks.collectedTo, localDate()) })
 const appliedFilters = reactive({ ...filters })
 const settingsSearch = ref('')
 const storedFontOffset = Number(localStorage.getItem('douyin-font-offset') ?? 2)
@@ -285,20 +324,24 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   return payload.data as T
 }
 function taskFromApi(item: any): Task {
-  const state: TaskState = item.state === 'done' ? '已完成' : item.state === 'failed' ? '失败' : item.state === 'cancelled' ? '已取消' : item.state === 'running' ? '运行中' : '待处理'
+  const state: TaskState = item.state === 'paused' ? '已暂停' : item.state === 'done' ? '已完成' : item.state === 'failed' ? '失败' : item.state === 'cancelled' ? '已取消' : item.state === 'running' ? '运行中' : '待处理'
   const steps = item.steps || {}
   const input = (item.urls || []).join('\n')
   const displayMode = input.includes('/collection/') ? '短视频合集' : input.includes('/user/') ? '指定作者' : '单个短视频'
-  return { id: item.id, title: item.title || item.mode || '采集任务', mode: displayMode, module: item.mode === 'run' ? '完整处理' : '仅采集', input, state, progress: item.progress || 0, createdAt: item.created_at || '', collectedAt: (item.created_at || '').slice(0, 10), publishedAt: '', author: '采集任务', transcript: item.error || '', likes: 0, favorites: 0, shares: 0, transcriptState: steps.transcribe === 'done' ? '已转写' : steps.transcribe === 'running' ? '转写中' : '未转写', commentsState: steps.comments === 'done' ? '已采集' : steps.comments === 'running' ? '采集中' : '未采集', inReadingList: readingIds.has(item.id)}
+  return { requestMode: item.mode, options: item.options || {}, id: item.id, title: item.title || item.mode || '采集任务', mode: displayMode, module: item.mode === 'run' ? '完整处理' : '仅采集', input, state, progress: item.progress || 0, createdAt: item.created_at || '', collectedAt: dateInShanghai(item.created_at || ''), publishedAt: '', author: '采集任务', transcript: item.error || '', likes: 0, favorites: 0, shares: 0, transcriptState: steps.transcribe === 'done' ? '已转写' : steps.transcribe === 'running' ? '转写中' : '未转写', commentsState: steps.comments === 'done' ? '已采集' : steps.comments === 'running' ? '采集中' : '未采集', inReadingList: readingIds.has(item.id)}
 }
 async function refreshTasks() {
   try { const result = await api<{ items: any[] }>('/api/tasks'); tasks.value = result.items.map(taskFromApi) } catch (error) { notify(`后端未连接：${(error as Error).message}`) }
 }
 async function refreshVideos() {
+  const version = ++videoRequestVersion
   if (videoSearch.publishedFrom && videoSearch.publishedTo && videoSearch.publishedFrom > videoSearch.publishedTo) {
+    videosLoading.value = false
     notify('开始日期不能晚于结束日期')
     return
   }
+  videosLoading.value = true
+  videoLoadError.value = ''
   const query = new URLSearchParams()
   for (const name of selectedAuthorNames.value) query.append('author_names', name)
   for (const tag of selectedTags.value) query.append('tags', tag)
@@ -309,19 +352,22 @@ async function refreshVideos() {
   try {
     query.set('limit', '500')
     const result = await api<{ items: CollectedVideo[]; total: number }>(`/api/videos?${query.toString()}`)
-    while (result.items.length < result.total) {
+    while (result.items.length < result.total && version === videoRequestVersion) {
       query.set('offset', String(result.items.length))
       const next = await api<{ items: CollectedVideo[]; total: number }>(`/api/videos?${query.toString()}`)
       if (!next.items.length) break
       result.items.push(...next.items)
     }
+    if (version !== videoRequestVersion) return
     videos.value = result.items
     if (selectedVideo.value) {
       const updated = result.items.find((item) => item.platform === selectedVideo.value?.platform && item.video_id === selectedVideo.value?.video_id)
       if (updated) Object.assign(selectedVideo.value, updated)
     }
     videoTotal.value = result.total
-  } catch (error) { notify(`视频数据读取失败：${(error as Error).message}`) }
+    return result
+  } catch (error) { if (version === videoRequestVersion) { videoLoadError.value = (error as Error).message; notify(`视频数据读取失败：${videoLoadError.value}`) } }
+  finally { if (version === videoRequestVersion) videosLoading.value = false }
 }
 async function openVideoDetail(video: CollectedVideo) {
   selectedVideo.value = video
@@ -352,8 +398,8 @@ async function confirmDeleteVideo() {
     notify(`已删除视频记录“${target.title || target.video_id}”`)
   } catch (error) { notify(`删除视频失败：${(error as Error).message}`) }
 }
-function resetVideoSearch() { videoSourceUrl.value = ''; selectedAuthorNames.value = []; authorSearch.value = ''; authorDropdownOpen.value = false; selectedTags.value = []; tagSearch.value = ''; tagDropdownOpen.value = false; dateDropdownOpen.value = false; videoSearch.title = ''; videoSearch.publishedFrom = ''; videoSearch.publishedTo = ''; refreshVideos() }
-function openTaskVideos(task: Task) {
+function resetVideoSearch() { videoSourceUrl.value = ''; selectedAuthorNames.value = []; authorSearch.value = ''; authorDropdownOpen.value = false; selectedTags.value = []; tagSearch.value = ''; tagDropdownOpen.value = false; dateDropdownOpen.value = false; videoSearch.title = ''; videoSearch.publishedFrom = localDate(-6); videoSearch.publishedTo = localDate(); refreshVideos() }
+async function openTaskVideos(task: Task) {
   const source = task.input.split('\n').map((item) => item.trim()).find(Boolean)
   if (!source) { notify('该任务没有可用的采集链接'); return }
   page.value = 'videos'
@@ -367,8 +413,14 @@ function openTaskVideos(task: Task) {
   videoSearch.title = ''
   videoSearch.publishedFrom = ''
   videoSearch.publishedTo = ''
-  refreshVideos()
+  const result = await refreshVideos()
+  if (result && videoSourceUrl.value === source) {
+    const names = [...new Set(result.items.map((video) => video.author_name || '未知作者'))]
+    if (names.length === 1) selectedAuthorNames.value = names
+  }
 }
+function clearVideoSource() { videoSourceUrl.value = ''; refreshVideos() }
+function clearVideoDates() { videoSearch.publishedFrom = ''; videoSearch.publishedTo = ''; dateDropdownOpen.value = false; refreshVideos() }
 function setVideoDateRange(range: 'today' | 'yesterday' | 'week' | 'month') {
   const endOffset = range === 'yesterday' ? -1 : 0
   const startOffset = range === 'week' ? -6 : range === 'month' ? -29 : endOffset
@@ -378,7 +430,13 @@ function setVideoDateRange(range: 'today' | 'yesterday' | 'week' | 'month') {
   refreshVideos()
 }
 function formatCount(value: number) { return new Intl.NumberFormat('zh-CN').format(value || 0) }
-function formatDateTime(value: string) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—' }
+function dateInShanghai(value: string) {
+  if (!value || Number.isNaN(new Date(value).getTime())) return ''
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(value))
+  const part = (type: string) => parts.find((item) => item.type === type)?.value
+  return `${part('year')}-${part('month')}-${part('day')}`
+}
+function formatDateTime(value: string) { return !value || Number.isNaN(new Date(value).getTime()) ? '—' : new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) }
 function processingLabel(video: CollectedVideo) { return video.transcript_status === 'complete' ? '已转写' : video.local_media_path ? '已下载' : video.metadata_status === 'failed' ? '采集失败' : '已采集' }
 type VideoAction = 'download' | 'comments' | 'transcribe' | 'report' | 'refresh'
 const videoActions: { key: VideoAction; done: string; pending: string; label: string; icon: string }[] = [
@@ -504,26 +562,42 @@ function notify(message: string) {
   toast.value = message
   window.setTimeout(() => { if (toast.value === message) toast.value = '' }, 2400)
 }
-function createTask() {
+async function createTask() {
+  if (editSaving.value) return
   if (!taskName.value.trim()) { notify('请填写采集任务名称'); return }
   if (!sourceUrl.value.trim()) { notify(transcribeOnly.value ? '请填写本地视频绝对路径' : '请先填写抖音链接'); return }
-  const mode = modeOptions.find((item) => item.id === activeMode.value)!
   if (!activeModules.value.length) { notify('至少选择一个处理模块'); return }
   if (transcribeOnly.value && !/^(?:[A-Za-z]:[\\/]|\/)/.test(sourceUrl.value.trim())) { notify('本地视频请填写绝对路径'); return }
   if (activeModules.value.includes('transcribe') && !transcribeOnly.value && !activeModules.value.includes('download')) { notify('转写与其他模块同时使用时，请同时选择“下载视频”'); return }
   const options: Record<string, unknown> = {
+    ...(editTarget.value?.options || {}),
     title: taskName.value.trim(),
     download_video: activeModules.value.includes('download'),
     transcribe_text: activeModules.value.includes('transcribe'),
     include_comments: activeModules.value.includes('comments'),
     generate_report: activeModules.value.includes('report'),
-    force_reprocess: config['crawl.refresh_completed'],
   }
+  delete options.local_video_path
+  delete options.refresh_completed
   if (transcribeOnly.value) options.local_video_path = sourceUrl.value.trim()
-  if (tempConfig.value) for (const key of selectedSettings.value) options[key === 'crawl.refresh_completed' ? 'force_reprocess' : key.split('.').slice(-1)[0]] = config[key] === '' ? null : config[key]
+  for (const setting of taskConfigOptions) {
+    delete options[setting.option]
+    if (tempConfig.value && selectedSettings.value.includes(setting.key)) {
+      const value = taskConfig[setting.key]
+      if (setting.kind === 'number' && value !== '' && (!Number.isInteger(Number(value)) || Number(value) < 1)) { notify(`${setting.label}请填写大于 0 的整数，留空表示不限制`); return }
+      options[setting.option] = setting.kind === 'toggle' ? Boolean(value) : value === '' ? null : Number(value)
+    }
+  }
   const taskMode = activeModules.value.some((item) => item !== 'comments') ? 'run' : 'collect'
-  const createdName = taskName.value.trim()
-  api('/api/tasks', { method: 'POST', body: JSON.stringify({ mode: taskMode, urls: transcribeOnly.value ? [] : [sourceUrl.value.trim()], options }) }).then(() => { showCreate.value = false; taskName.value = ''; sourceUrl.value = ''; notify(`已创建“${createdName || mode.title}”任务`); refreshTasks() }).catch((error) => notify(`创建失败：${error.message}`))
+  const editing = editTarget.value
+  editSaving.value = true
+  try {
+    await api(editing ? `/api/tasks/${editing.id}` : '/api/tasks', { method: editing ? 'PUT' : 'POST', body: JSON.stringify({ mode: taskMode, urls: transcribeOnly.value ? [] : sourceUrl.value.split('\n').map((url) => url.trim()).filter(Boolean), options }) })
+    closeTaskForm()
+    notify(editing ? '任务及配置已保存，下次执行时生效' : `已创建“${taskName.value}”任务`)
+    await refreshTasks()
+  } catch (error) { notify(`${editing ? '修改' : '创建'}失败：${(error as Error).message}`) }
+  finally { editSaving.value = false }
 }
 function toggleModule(id: TaskModule) {
   if (activeModules.value.includes(id)) {
@@ -545,13 +619,13 @@ function confirmDelete() {
   api(`/api/tasks/${id}`, { method: 'DELETE' }).then(() => { tasks.value = tasks.value.filter((task) => task.id !== id); deleteTarget.value = null; notify(`已删除“${title}”`) }).catch((error) => notify(`删除失败：${error.message}`))
 }
 let eventSource: EventSource | null = null
-onMounted(() => { document.addEventListener('click', closeAuthorDropdown); document.addEventListener('click', closeTagDropdown); document.addEventListener('click', closeDateDropdown); document.addEventListener('click', closeTaskDateDropdown); document.documentElement.style.setProperty('--font-offset', `${fontOffset.value}px`); refreshTasks(); refreshVideos(); loadSettings(); eventSource = new EventSource(`${API_BASE}/api/tasks/events`); eventSource.addEventListener('tasks', (event) => { tasks.value = JSON.parse((event as MessageEvent).data).map(taskFromApi); if (page.value === 'videos') refreshVideos() }) })
-onBeforeUnmount(() => { document.removeEventListener('click', closeAuthorDropdown); document.removeEventListener('click', closeTagDropdown); document.removeEventListener('click', closeDateDropdown); document.removeEventListener('click', closeTaskDateDropdown); clearTimeout(authorSearchTimer); clearTimeout(tagSearchTimer); eventSource?.close() })
+onMounted(() => { document.addEventListener('click', closeAuthorDropdown); document.addEventListener('click', closeTagDropdown); document.addEventListener('click', closeDateDropdown); document.addEventListener('click', closeTaskDateDropdown); document.addEventListener('click', closeTaskStatus); document.documentElement.style.setProperty('--font-offset', `${fontOffset.value}px`); refreshTasks(); refreshVideos(); loadSettings(); eventSource = new EventSource(`${API_BASE}/api/tasks/events`); eventSource.addEventListener('tasks', (event) => { tasks.value = JSON.parse((event as MessageEvent).data).map(taskFromApi); if (page.value === 'videos') refreshVideos() }) })
+onBeforeUnmount(() => { document.removeEventListener('click', closeAuthorDropdown); document.removeEventListener('click', closeTagDropdown); document.removeEventListener('click', closeDateDropdown); document.removeEventListener('click', closeTaskDateDropdown); document.removeEventListener('click', closeTaskStatus); clearTimeout(authorSearchTimer); clearTimeout(tagSearchTimer); eventSource?.close() })
 function clearFilters() {
   taskDateDropdownOpen.value = false
   taskFilter.value = '全部任务'
   appliedTaskFilter.value = '全部任务'
-  Object.assign(filters, { videoName: '', collectedFrom: localDate(), collectedTo: localDate() })
+  Object.assign(filters, { videoName: '', collectedFrom: localDate(-6), collectedTo: localDate() })
   Object.assign(appliedFilters, filters)
 }
 function setDateRange(range: 'today' | 'yesterday' | 'week' | 'month') {
@@ -586,6 +660,49 @@ async function toggleApiKey() {
     } finally { keyLoading.value = false }
   }
   revealKey.value = true
+}
+watch([filters, taskFilter], () => localStorage.setItem('douyin-task-search-v1', JSON.stringify({ ...filters, status: taskFilter.value })), { deep: true, flush: 'sync' })
+watch([videoSearch, selectedAuthorNames, selectedTags, videoSourceUrl], () => localStorage.setItem('douyin-video-search-v1', JSON.stringify({ ...videoSearch, authors: selectedAuthorNames.value, tags: selectedTags.value, sourceUrl: videoSourceUrl.value })), { deep: true, flush: 'sync' })
+const pausingTasks = ref<string[]>([])
+async function pauseOrResume(task: Task) {
+  if (pausingTasks.value.includes(task.id)) return
+  pausingTasks.value.push(task.id)
+  try {
+    await api(`/api/tasks/${task.id}/${task.state === '已暂停' ? 'resume' : 'pause'}`, { method: 'POST' })
+    notify(task.state === '已暂停' ? '任务已继续' : '已请求暂停，当前步骤结束后停止')
+    await refreshTasks()
+  } catch (error) { notify((error as Error).message) }
+  finally { pausingTasks.value = pausingTasks.value.filter((id) => id !== task.id) }
+}
+const editTarget = ref<Task | null>(null)
+const editSaving = ref(false)
+function initTaskConfig(task?: Task) {
+  for (const setting of taskConfigOptions) taskConfig[setting.key] = task?.options[setting.option] ?? config[setting.key] ?? ''
+  // An explicit null means unlimited, even if the global configuration has a limit.
+  for (const setting of taskConfigOptions) if (task && task.options[setting.option] === null) taskConfig[setting.key] = ''
+  selectedSettings.value = task ? taskConfigOptions.filter((setting) => Object.prototype.hasOwnProperty.call(task.options, setting.option)).map((setting) => setting.key) : []
+  tempConfig.value = !!task
+}
+function openNewTask() {
+  editTarget.value = null
+  taskName.value = ''
+  sourceUrl.value = ''
+  activeMode.value = 'video'
+  activeModules.value = ['download', 'transcribe', 'comments', 'report']
+  initTaskConfig()
+  page.value = 'tasks'
+  showCreate.value = true
+}
+function closeTaskForm() { showCreate.value = false; editTarget.value = null }
+function editTask(task: Task) {
+  editTarget.value = task
+  taskName.value = task.title
+  sourceUrl.value = task.options.local_video_path || task.input
+  activeMode.value = task.mode === '指定作者' ? 'author' : task.mode === '短视频合集' ? 'collection' : 'video'
+  activeModules.value = moduleOptions.filter((module) => task.options[({ download: 'download_video', transcribe: 'transcribe_text', comments: 'include_comments', report: 'generate_report' })[module.id]] ?? (task.requestMode === 'run' || module.id === 'comments')).map((module) => module.id)
+  initTaskConfig(task)
+  page.value = 'tasks'
+  showCreate.value = true
 }
 const updatingTasks = ref<string[]>([])
 async function updateTask(task: Task) {
@@ -634,7 +751,7 @@ watch(page, (value) => localStorage.setItem('douyin-current-page', value))
       <div class="side-label">工作空间</div>
       <button class="nav-item" :class="{ active: page === 'overview' }" @click="page = 'overview'"><span class="nav-icon">▧</span><span>概况预览</span><span v-if="page === 'overview'" class="nav-current"></span></button>
       <button class="nav-item" :class="{ active: page === 'tasks' }" @click="page = 'tasks'"><span class="nav-icon">▦</span><span>任务列表</span><span v-if="page === 'tasks'" class="nav-current"></span></button>
-      <button class="nav-item" :class="{ active: page === 'videos' }" @click="page = 'videos'; resetVideoSearch()"><span class="nav-icon">▶</span><span>采集视频</span><span v-if="page === 'videos'" class="nav-current"></span></button>
+      <button class="nav-item" :class="{ active: page === 'videos' }" @click="page = 'videos'; refreshVideos()"><span class="nav-icon">▶</span><span>采集视频</span><span v-if="page === 'videos'" class="nav-current"></span></button>
       <div class="side-label settings-label">偏好设置</div>
       <button class="nav-item" :class="{ active: page === 'settings' }" @click="page = 'settings'"><span class="nav-icon">⚙</span><span>采集配置</span><span v-if="page === 'settings'" class="nav-current"></span></button>
       <div class="sidebar-bottom"><div class="runtime-card"><div class="runtime-head"><span class="status-dot"></span>本地工作模式</div><p>任务由本机 Python 服务处理<br />状态保存在 SQLite</p><div class="runtime-chip">工作台 <span>v0.2</span></div></div><div class="user-row"><div class="avatar">W</div><div><strong>本机用户</strong><small>个人工作空间</small></div><span class="dots">···</span></div></div>
@@ -644,46 +761,46 @@ watch(page, (value) => localStorage.setItem('douyin-current-page', value))
       <header class="topbar"><div class="breadcrumb"><span>工作空间</span><b>/</b><strong>{{ page === 'overview' ? '概况预览' : page === 'tasks' ? '任务列表' : page === 'videos' ? '采集视频' : '采集配置' }}</strong></div><div class="top-actions"><div class="font-control" aria-label="全局字体大小"><button aria-label="缩小字体" :disabled="fontOffset === 0" @click="changeFontSize(-1)">A−</button><span>字号 +{{ fontOffset }}px</span><button aria-label="放大字体" :disabled="fontOffset === 6" @click="changeFontSize(1)">A＋</button></div><span class="local-badge"><i></i>本地运行</span><button class="icon-button" aria-label="帮助" @click="notify('任务状态会从本机后端实时更新')">?</button><div class="top-avatar">W</div></div></header>
 
       <section v-if="page === 'overview'" class="page-content overview-page">
-        <div class="page-heading"><div><div class="eyebrow">WORKSPACE <span>·</span> 数据总览</div><h1>概况预览</h1><p>集中查看采集任务与内容处理情况。</p></div><button class="primary-button" @click="page = 'tasks'; showCreate = true"><span>＋</span> 新建任务</button></div>
+        <div class="page-heading"><div><div class="eyebrow">WORKSPACE <span>·</span> 数据总览</div><h1>概况预览</h1><p>集中查看采集任务与内容处理情况。</p></div><button class="primary-button" @click="openNewTask"><span>＋</span> 新建任务</button></div>
         <div class="stats-grid"><article class="stat-card"><div class="stat-top"><span>全部任务</span><span class="stat-icon indigo">▦</span></div><strong>{{ tasks.length }}</strong><small>本地任务记录</small></article><article class="stat-card"><div class="stat-top"><span>运行中</span><span class="stat-icon blue">◌</span></div><strong>{{ tasks.filter(t => t.state === '运行中').length }}</strong><small><i class="status-dot"></i>正在处理</small></article><article class="stat-card"><div class="stat-top"><span>已完成</span><span class="stat-icon green">✓</span></div><strong>{{ tasks.filter(t => t.state === '已完成').length }}</strong><small>处理成功</small></article><article class="stat-card"><div class="stat-top"><span>需要关注</span><span class="stat-icon amber">!</span></div><strong>{{ tasks.filter(t => t.state === '失败').length }}</strong><small>查看失败原因</small></article></div>
         <div class="overview-grid"><section class="overview-card"><div class="overview-card-head"><div><h2>最近任务</h2><p>最近加入本机队列的采集任务</p></div><button class="text-link" @click="page = 'tasks'">查看全部 →</button></div><div v-for="task in tasks.slice(0, 4)" :key="task.id" class="overview-video"><div class="overview-play">▶</div><div class="overview-video-copy"><strong>{{ task.title }}</strong><small>{{ task.mode }} · {{ task.collectedAt }}</small></div><span class="overview-metric">{{ task.progress }}%</span></div></section><section class="overview-card overview-status"><div class="overview-card-head"><div><h2>处理概况</h2><p>各处理环节的当前状态</p></div></div><div class="overview-status-row"><span class="status-symbol violet">◖</span><div><strong>视频采集</strong><small>采集视频信息与媒体文件</small></div><b>{{ tasks.length }} 条</b></div><div class="overview-status-row"><span class="status-symbol blue">☷</span><div><strong>评论采集</strong><small>评论与回复采集完成</small></div><b>{{ tasks.filter(t => t.commentsState === '已采集').length }} 条</b></div><div class="overview-status-row"><span class="status-symbol green">≋</span><div><strong>语音转写</strong><small>已生成转写内容</small></div><b>{{ tasks.filter(t => t.transcriptState === '已转写').length }} 条</b></div><button class="overview-link" @click="page = 'tasks'">前往任务列表 <span>→</span></button></section></div>
       </section>
 
       <section v-else-if="page === 'tasks'" class="page-content">
-        <div class="page-heading"><div><div class="eyebrow">WORKSPACE <span>·</span> 任务中心</div><h1>任务列表</h1><p>查看任务进度、状态和错误信息。</p></div><button class="primary-button" @click="showCreate = true"><span>＋</span> 新建任务</button></div>
+        <div class="page-heading"><div><div class="eyebrow">WORKSPACE <span>·</span> 任务中心</div><h1>任务列表</h1><p>查看任务进度、状态和错误信息。</p></div><button class="primary-button" @click="openNewTask"><span>＋</span> 新建任务</button></div>
 
         <section class="search-panel task-search-panel">
           <div class="search-main">
             <label class="search-box title-search"><span>⌕</span><input v-model="filters.videoName" placeholder="任务名称" @keyup.enter="applyFilters" /></label>
             <div ref="taskDatePicker" class="video-date-picker" @keydown.esc.stop="taskDateDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="taskDateDropdownOpen" aria-controls="task-date-menu" :title="taskDateLabel" @click="taskDateDropdownOpen = !taskDateDropdownOpen"><svg viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true"><rect x="3" y="4" width="14" height="13" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M6 2v4m8-4v4M3 9h14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><span class="author-selection-text">{{ taskDateLabel }}</span><span>⌄</span></button><div v-if="taskDateDropdownOpen" id="task-date-menu" class="video-date-menu"><div class="date-menu-heading"><strong>任务创建时间</strong><button type="button" @click="filters.collectedFrom = ''; filters.collectedTo = ''; taskDateDropdownOpen = false; applyFilters()">清空</button></div><div class="date-menu-fields"><label>开始日期<input id="task-created-from" v-model="filters.collectedFrom" type="date" :max="filters.collectedTo || undefined" @change="applyFilters" /></label><span>至</span><label>结束日期<input v-model="filters.collectedTo" type="date" :min="filters.collectedFrom || undefined" @change="applyFilters" /></label></div><div class="date-menu-shortcuts"><button type="button" @click="setDateRange('today')">今天</button><button type="button" @click="setDateRange('yesterday')">昨天</button><button type="button" @click="setDateRange('week')">近一周</button><button type="button" @click="setDateRange('month')">近一月</button></div></div></div>
-            <select v-model="taskFilter" aria-label="任务状态"><option>全部任务</option><option>运行中</option><option>已完成</option><option>待处理</option><option>失败</option><option>已取消</option></select>
+            <div ref="taskStatusPicker" class="task-status-picker" @keydown="moveTaskStatus" @keydown.esc.stop="taskStatusOpen = false"><button type="button" class="author-picker-trigger task-status-trigger" aria-label="任务状态" aria-haspopup="listbox" aria-controls="task-status-options" :aria-expanded="taskStatusOpen" @click="taskStatusOpen = !taskStatusOpen"><span class="status-option-dot" :class="taskStatusOptions.find((option) => option.label === taskFilter)?.tone"></span><span class="author-selection-text">{{ taskFilter }}</span><svg width="15" height="15" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m6 8 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg></button><div v-if="taskStatusOpen" id="task-status-options" class="task-status-menu" role="listbox" aria-label="任务状态"><button v-for="option in taskStatusOptions" :key="option.label" type="button" role="option" :aria-selected="taskFilter === option.label" :class="{ selected: taskFilter === option.label }" @click="chooseTaskStatus(option.label)"><span class="status-option-dot" :class="option.tone"></span><span>{{ option.label }}</span><svg v-if="taskFilter === option.label" width="15" height="15" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m5 10 3 3 7-7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg></button></div></div>
             <button class="primary-button query-button" @click="applyFilters">查询</button>
           </div>
           <div class="search-foot"><span>可按任务名称、创建时间和状态筛选</span><div><span>已找到 <b>{{ visibleTasks.length }}</b> 条</span><button class="clear-filters" @click="clearFilters">重置条件</button></div></div>
         </section>
 
-        <section v-if="showCreate" class="modal-backdrop" @click.self="showCreate = false"><div class="create-panel" role="dialog" aria-modal="true" aria-labelledby="create-title"><div class="panel-heading"><div><span class="eyebrow">NEW TASK</span><h2 id="create-title">创建采集任务</h2><p>选择内容来源和处理模块。</p></div><button class="close-button" aria-label="关闭" @click="showCreate = false">×</button></div>
+        <section v-if="showCreate" class="modal-backdrop" @click.self="!editSaving && closeTaskForm()"><div class="create-panel" role="dialog" aria-modal="true" aria-labelledby="create-title"><div class="panel-heading"><div><span class="eyebrow">{{ editTarget ? 'EDIT TASK' : 'NEW TASK' }}</span><h2 id="create-title">{{ editTarget ? '修改采集任务' : '创建采集任务' }}</h2><p>{{ editTarget ? '调整内容来源、处理模块和本次任务配置。' : '选择内容来源和处理模块。' }}</p></div><button class="close-button" aria-label="关闭" @click="closeTaskForm" :disabled="editSaving">×</button></div>
           <div class="form-section"><label class="field-label task-name-label" for="task-name">采集任务名称<span>必填</span></label><div class="url-input"><span>✎</span><input id="task-name" v-model="taskName" maxlength="80" placeholder="例如：10月竞品账号采集" /></div><div class="field-hint">任务名称会显示在列表中，并可用于搜索。</div></div>
           <div class="form-section"><div class="section-title"><span class="step-number">1</span><div><strong>{{ transcribeOnly ? '选择本地视频' : '选择采集来源' }}</strong><small>{{ transcribeOnly ? '仅转写时使用本机已有的视频文件' : '告诉我们要从哪里获取内容' }}</small></div></div><div v-if="!transcribeOnly" class="choice-grid"><button v-for="item in modeOptions" :key="item.id" class="choice-card" :class="{ selected: activeMode === item.id }" @click="activeMode = item.id"><span class="choice-icon">{{ item.icon }}</span><span class="choice-copy"><strong>{{ item.title }}</strong><small>{{ item.desc }}</small></span><span class="radio-dot"></span></button></div>
             <label class="field-label" for="source-url">{{ transcribeOnly ? '本地视频绝对路径' : activeMode === 'video' ? '视频链接' : activeMode === 'collection' ? '合集链接' : '作者主页链接' }}<span>必填</span></label><div class="url-input"><span>{{ transcribeOnly ? '▣' : '↗' }}</span><input id="source-url" v-model="sourceUrl" :placeholder="transcribeOnly ? '例如：D:\\videos\\sample.mp4' : '粘贴抖音链接或分享文案'" /><button v-if="sourceUrl" class="clear-input" @click="sourceUrl = ''">×</button></div><div class="field-hint">{{ transcribeOnly ? '必须使用存在且可读的本地文件绝对路径。' : '支持粘贴完整分享文案，系统会识别其中的抖音链接。' }}</div>
           </div>
           <div class="form-section"><div class="section-title"><span class="step-number">2</span><div><strong>选择处理模块</strong><small>四项默认全选，可按任务需要关闭</small></div></div><div class="module-grid"><button v-for="item in moduleOptions" :key="item.id" class="module-card" :class="{ selected: activeModules.includes(item.id) }" @click="toggleModule(item.id)"><span class="module-check">{{ activeModules.includes(item.id) ? '✓' : '' }}</span><strong>{{ item.title }}</strong><small>{{ item.desc }}</small></button></div><div v-if="activeModules.includes('transcribe')" class="transcribe-notice"><span>i</span>{{ transcribeOnly ? '仅转写文字时，需要填写本地视频的绝对路径。' : '转写与其他模块同时使用时，需要同时选择“下载视频”。' }}</div></div>
-          <div class="form-section temp-section"><div class="temp-copy"><div class="temp-icon">⚙</div><div><strong>本次任务临时配置</strong><small>默认配置来自“采集配置”页面</small></div></div><button class="switch" :class="{ on: tempConfig }" role="switch" :aria-checked="tempConfig" @click="tempConfig = !tempConfig"><span></span></button><div v-if="tempConfig" class="temp-editor"><p>选择本次要覆盖的配置项，未选择的项目继续使用默认配置。</p><label v-for="option in [{key:'crawl.max_comments_per_video',label:'单视频评论上限'},{key:'inputs.max_videos_per_profile',label:'作者作品上限'},{key:'inputs.max_videos_per_collection',label:'合集作品上限'},{key:'crawl.refresh_completed',label:'重新处理已完成作品'}]" :key="option.key" class="temp-option"><input v-model="selectedSettings" type="checkbox" :value="option.key" /><span>{{ option.label }}</span><b>{{ config[option.key] === '' ? '不限制' : config[option.key] }}</b></label><button class="text-link" @click="page = 'settings'">管理默认配置 <span>↗</span></button></div></div>
-          <div class="create-footer"><span><i class="status-dot"></i>任务将在本机队列中处理</span><div><button class="secondary-button" @click="showCreate = false">取消</button><button class="primary-button" @click="createTask">开始任务 <span>→</span></button></div></div>
+          <div class="form-section temp-section"><div class="temp-copy"><div class="temp-icon">⚙</div><div><strong>本次任务配置</strong><small>仅对本次任务生效，不改变全局配置</small></div></div><button class="switch" :class="{ on: tempConfig }" role="switch" :aria-checked="tempConfig" @click="tempConfig = !tempConfig"><span></span></button><div v-if="tempConfig" class="temp-editor"><p>勾选配置项后可修改数值；上限留空表示不限制，未勾选的项使用全局配置。</p><div v-for="option in taskConfigOptions" :key="option.key" class="temp-config-row"><label class="temp-option"><input v-model="selectedSettings" type="checkbox" :value="option.key" /><span>{{ option.label }}</span></label><label v-if="option.kind === 'toggle'" class="task-config-toggle"><input v-model="taskConfig[option.key]" type="checkbox" :disabled="!selectedSettings.includes(option.key)" :aria-label="option.label" />启用</label><input v-else v-model="taskConfig[option.key]" type="number" min="1" step="1" placeholder="不限制" :disabled="!selectedSettings.includes(option.key)" :aria-label="option.label" /></div></div></div>
+          <div class="create-footer"><span><i class="status-dot"></i>{{ editTarget ? '保存后下次执行时生效' : '任务将在本机队列中处理' }}</span><div><button class="secondary-button" @click="closeTaskForm" :disabled="editSaving">取消</button><button class="primary-button" :disabled="editSaving" @click="createTask">{{ editSaving ? '保存中…' : editTarget ? '保存修改' : '开始任务' }} <span>→</span></button></div></div>
         </div></section>
 
         <section class="task-panel"><div class="task-panel-head"><div><h2>最近任务</h2><p>按创建时间倒序排列</p></div><span class="recent-count">{{ visibleTasks.length }} 条记录</span></div>
-          <div class="batch-toolbar"><label class="batch-select-all"><input type="checkbox" :disabled="batchBusy || !visibleTasks.length" :checked="!!visibleTasks.length && selectedTaskIds.length === visibleTasks.length" :indeterminate="selectedTaskIds.length > 0 && selectedTaskIds.length < visibleTasks.length" @change="toggleAllTasks(($event.target as HTMLInputElement).checked)" />全选</label><span>已选 {{ selectedTaskIds.length }} 条</span><select v-model="batchTaskAction" :disabled="batchBusy" aria-label="任务批量操作"><option value="update">批量更新</option><option value="retry">批量重试</option><option value="delete">批量删除</option></select><button :disabled="batchBusy || !selectedTaskIds.length" :class="{ danger: batchTaskAction === 'delete' }" @click="requestBatch('tasks')">{{ batchBusy ? '提交中…' : '执行' }}</button><button class="batch-clear" :disabled="batchBusy || !selectedTaskIds.length" @click="selectedTaskIds = []">取消选择</button><small>更新仅适用于合集和作者任务</small></div><div class="task-table-wrap"><table class="task-table"><thead><tr><th class="selection-cell">选择</th><th>任务</th><th>类型</th><th>创建时间</th><th>进度</th><th>状态</th><th>错误信息</th><th>操作</th></tr></thead><tbody><tr v-for="task in visibleTasks" :key="task.id" :class="{ 'batch-selected': selectedTaskIds.includes(task.id) }"><td class="selection-cell"><input v-model="selectedTaskIds" type="checkbox" :value="task.id" :disabled="batchBusy" :aria-label="`选择任务 ${task.title}`" /></td><td><div class="task-name"><div class="task-type-icon" :class="task.mode === '指定作者' ? 'author' : task.mode === '短视频合集' ? 'collection' : ''">{{ task.mode === '指定作者' ? '◎' : task.mode === '短视频合集' ? '▤' : '▶' }}</div><div class="video-title clickable-video" role="button" tabindex="0" @click.stop="openTaskVideos(task)" @keydown.enter.stop="openTaskVideos(task)"><strong>{{ task.title }}</strong><small>{{ task.id }} · {{ task.collectedAt }}</small></div><button class="bookmark-button" :class="{ bookmarked: task.inReadingList }" :aria-label="task.inReadingList ? '取消标记' : '标记任务'" :title="task.inReadingList ? '已标记' : '标记任务'" @click.stop="toggleReading(task)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.75 4.75h10.5a1 1 0 0 1 1 1v14l-6.25-3.8-6.25 3.8v-14a1 1 0 0 1 1-1Z" /></svg></button></div></td><td><div class="author-cell">{{ task.mode }}</div></td><td class="time-cell">{{ task.createdAt || '—' }}</td><td class="metric-cell">{{ task.progress }}%</td><td>{{ task.state }}</td><td><button v-if="task.transcript" class="task-error-preview" title="点击查看完整错误" @click.stop="errorTarget = task">{{ task.transcript.length > 36 ? task.transcript.slice(0, 36) + '…' : task.transcript }}</button><span v-else>—</span></td><td><div class="row-actions"><button v-if="task.mode === '短视频合集' || task.mode === '指定作者'" class="task-update-inline" :disabled="updatingTasks.includes(task.id) || retryingTasks.includes(task.id) || task.state === '运行中' || task.state === '待处理'" title="重新检查作品列表，只采集未入库视频" :aria-label="`增量更新任务 ${task.title}`" @click.stop="updateTask(task)"><span>⟳</span><small>{{ updatingTasks.includes(task.id) ? '提交中' : '更新' }}</small></button><button class="task-retry-inline" :disabled="retryingTasks.includes(task.id) || updatingTasks.includes(task.id) || task.state === '运行中' || task.state === '待处理'" :aria-label="`重试任务 ${task.title}`" :title="task.state === '运行中' || task.state === '待处理' ? '任务正在处理中' : '在原任务上重新执行'" @click.stop="retryTask(task)"><span>↻</span><small>{{ retryingTasks.includes(task.id) ? '提交中' : '重试' }}</small></button><button class="task-delete-inline" aria-label="删除任务" title="删除任务" @click.stop="deleteTarget = task"><span>⌫</span><small>删除</small></button></div></td></tr><tr v-if="visibleTasks.length === 0"><td colspan="8" class="empty-state">没有符合条件的任务</td></tr></tbody></table></div><div class="table-footer"><span>显示最近 <b>{{ visibleTasks.length }}</b> 条任务</span><div class="pagination"><button disabled>‹</button><button class="current-page">1</button><button disabled>›</button></div></div>
+          <div class="batch-toolbar"><label class="batch-select-all"><input type="checkbox" :disabled="batchBusy || !visibleTasks.length" :checked="!!visibleTasks.length && selectedTaskIds.length === visibleTasks.length" :indeterminate="selectedTaskIds.length > 0 && selectedTaskIds.length < visibleTasks.length" @change="toggleAllTasks(($event.target as HTMLInputElement).checked)" />全选</label><span>已选 {{ selectedTaskIds.length }} 条</span><select v-model="batchTaskAction" :disabled="batchBusy" aria-label="任务批量操作"><option value="update">批量更新</option><option value="retry">批量重试</option><option value="delete">批量删除</option></select><button :disabled="batchBusy || !selectedTaskIds.length" :class="{ danger: batchTaskAction === 'delete' }" @click="requestBatch('tasks')">{{ batchBusy ? '提交中…' : '执行' }}</button><button class="batch-clear" :disabled="batchBusy || !selectedTaskIds.length" @click="selectedTaskIds = []">取消选择</button><small>更新仅适用于合集和作者任务</small></div><div class="task-table-wrap"><table class="task-table"><thead><tr><th class="selection-cell">选择</th><th>任务</th><th>类型</th><th>创建时间</th><th>进度</th><th>状态</th><th>错误信息</th><th>操作</th></tr></thead><tbody><tr v-for="task in visibleTasks" :key="task.id" :class="{ 'batch-selected': selectedTaskIds.includes(task.id) }"><td class="selection-cell"><input v-model="selectedTaskIds" type="checkbox" :value="task.id" :disabled="batchBusy" :aria-label="`选择任务 ${task.title}`" /></td><td><div class="task-name"><div class="task-type-icon" :class="task.mode === '指定作者' ? 'author' : task.mode === '短视频合集' ? 'collection' : ''">{{ task.mode === '指定作者' ? '◎' : task.mode === '短视频合集' ? '▤' : '▶' }}</div><div class="video-title clickable-video" role="button" tabindex="0" @click.stop="openTaskVideos(task)" @keydown.enter.stop="openTaskVideos(task)"><strong>{{ task.title }}</strong><small>{{ task.id }} · {{ task.collectedAt }}</small></div><button class="bookmark-button" :class="{ bookmarked: task.inReadingList }" :aria-label="task.inReadingList ? '取消标记' : '标记任务'" :title="task.inReadingList ? '已标记' : '标记任务'" @click.stop="toggleReading(task)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.75 4.75h10.5a1 1 0 0 1 1 1v14l-6.25-3.8-6.25 3.8v-14a1 1 0 0 1 1-1Z" /></svg></button></div></td><td><div class="author-cell">{{ task.mode }}</div></td><td class="time-cell">{{ formatDateTime(task.createdAt) }}</td><td class="metric-cell">{{ task.progress }}%</td><td>{{ task.state }}</td><td><button v-if="task.transcript" class="task-error-preview" title="点击查看完整错误" @click.stop="errorTarget = task">{{ task.transcript.length > 36 ? task.transcript.slice(0, 36) + '…' : task.transcript }}</button><span v-else>—</span></td><td><div class="row-actions"><button v-if="task.state === '运行中' || task.state === '待处理' || task.state === '已暂停'" class="task-retry-inline" :disabled="pausingTasks.includes(task.id)" @click.stop="pauseOrResume(task)"><span>{{ task.state === '已暂停' ? '▶' : 'Ⅱ' }}</span><small>{{ task.state === '已暂停' ? '继续' : '暂停' }}</small></button><button class="task-retry-inline" :disabled="task.state === '运行中' || task.state === '待处理' || !!task.options.video_action" :title="task.options.video_action ? '视频单项操作请从视频列表重新发起' : task.state === '运行中' || task.state === '待处理' ? '先暂停任务再修改' : '修改任务及采集配置'" @click.stop="editTask(task)"><span>✎</span><small>修改</small></button><button v-if="task.mode === '短视频合集' || task.mode === '指定作者'" class="task-update-inline" :disabled="updatingTasks.includes(task.id) || retryingTasks.includes(task.id) || task.state === '运行中' || task.state === '待处理'" title="重新检查作品列表，只采集未入库视频" :aria-label="`增量更新任务 ${task.title}`" @click.stop="updateTask(task)"><span>⟳</span><small>{{ updatingTasks.includes(task.id) ? '提交中' : '更新' }}</small></button><button class="task-retry-inline" :disabled="retryingTasks.includes(task.id) || updatingTasks.includes(task.id) || task.state === '运行中' || task.state === '待处理'" :aria-label="`重试任务 ${task.title}`" :title="task.state === '运行中' || task.state === '待处理' ? '任务正在处理中' : '在原任务上重新执行'" @click.stop="retryTask(task)"><span>↻</span><small>{{ retryingTasks.includes(task.id) ? '提交中' : '重试' }}</small></button><button class="task-delete-inline" aria-label="删除任务" title="删除任务" @click.stop="deleteTarget = task"><span>⌫</span><small>删除</small></button></div></td></tr><tr v-if="visibleTasks.length === 0"><td colspan="8" class="empty-state">没有符合条件的任务</td></tr></tbody></table></div><div class="table-footer"><span>显示最近 <b>{{ visibleTasks.length }}</b> 条任务</span><div class="pagination"><button disabled>‹</button><button class="current-page">1</button><button disabled>›</button></div></div>
         </section>
         <div class="demo-note"><span>i</span><div><strong>本机任务队列</strong><p>任务状态保存在 SQLite；服务重启后仍可查看和重试。</p></div><button @click="page = 'settings'">前往配置 <span>→</span></button></div>
       </section>
 
       <section v-else-if="page === 'videos'" class="page-content videos-page">
-        <div class="page-heading"><div><div class="eyebrow">CONTENT <span>·</span> 采集结果</div><h1>采集视频</h1><p>查看视频基础信息、互动数据、处理状态和评论内容。</p></div><button class="primary-button" @click="page = 'tasks'; showCreate = true"><span>＋</span> 新建采集</button></div>
-        <section class="search-panel video-search-panel"><div class="video-search-main"><div ref="authorPicker" class="author-picker" @keydown.esc.stop="authorDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="authorDropdownOpen" aria-controls="author-options-menu" @click="toggleAuthorDropdown"><span class="author-selection-text">{{ selectedAuthorNames.length ? selectedAuthorNames.join('、') : '选择作者名称（支持多选）' }}</span><span v-if="selectedAuthorNames.length" class="author-selection-count">{{ selectedAuthorNames.length }}</span><span>⌄</span></button><div v-if="authorDropdownOpen" id="author-options-menu" class="author-options-menu"><input v-model="authorSearch" class="author-options-search" aria-label="搜索作者名称" placeholder="输入作者名称模糊搜索" /><div class="author-options-toolbar"><span>已选 {{ selectedAuthorNames.length }} 位作者</span><button type="button" @click="selectedAuthorNames = []; refreshVideos()">清空</button></div><div class="author-options-list"><p v-if="authorOptionsLoading">正在加载…</p><p v-else-if="authorOptionsFailed">作者列表加载失败 <button type="button" @click="loadAuthorOptions">重试</button></p><p v-else-if="!authorOptions.length">没有匹配的作者</p><label v-for="option in authorOptionsLoading || authorOptionsFailed ? [] : authorOptions" :key="option.name"><input v-model="selectedAuthorNames" type="checkbox" :value="option.name" @change="refreshVideos" /><span>{{ option.name }}</span><small>{{ option.count }} 条</small></label></div></div></div><div ref="tagPicker" class="author-picker" @keydown.esc.stop="tagDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="tagDropdownOpen" aria-controls="tag-options-menu" @click="toggleTagDropdown"><span class="author-selection-text">{{ selectedTags.length ? selectedTags.join('、') : '选择视频标签（支持多选）' }}</span><span v-if="selectedTags.length" class="author-selection-count">{{ selectedTags.length }}</span><span>⌄</span></button><div v-if="tagDropdownOpen" id="tag-options-menu" class="author-options-menu"><input v-model="tagSearch" class="author-options-search" aria-label="搜索视频标签" placeholder="输入视频标签模糊搜索" /><div class="author-options-toolbar"><span>已选 {{ selectedTags.length }} 个标签</span><button type="button" @click="selectedTags = []; refreshVideos()">清空</button></div><div class="author-options-list"><p v-if="tagOptionsLoading">正在加载…</p><p v-else-if="tagOptionsFailed">标签列表加载失败 <button type="button" @click="loadTagOptions">重试</button></p><p v-else-if="!tagOptions.length">没有匹配的标签</p><label v-for="option in tagOptionsLoading || tagOptionsFailed ? [] : tagOptions" :key="option.name"><input v-model="selectedTags" type="checkbox" :value="option.name" @change="refreshVideos" /><span>#{{ option.name }}</span><small>{{ option.count }} 条</small></label></div></div></div><label class="search-box video-search-box"><span>⌕</span><input v-model="videoSearch.title" placeholder="视频标题或简介关键词" @keyup.enter="refreshVideos" /></label><div ref="datePicker" class="video-date-picker" @keydown.esc.stop="dateDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="dateDropdownOpen" aria-controls="video-date-menu" :title="videoDateLabel" @click="dateDropdownOpen = !dateDropdownOpen"><svg viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true"><rect x="3" y="4" width="14" height="13" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M6 2v4m8-4v4M3 9h14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><span class="author-selection-text">{{ videoDateLabel }}</span><span>⌄</span></button><div v-if="dateDropdownOpen" id="video-date-menu" class="video-date-menu"><div class="date-menu-heading"><strong>视频发布时间</strong><button type="button" @click="videoSearch.publishedFrom = ''; videoSearch.publishedTo = ''; dateDropdownOpen = false; refreshVideos()">清空</button></div><div class="date-menu-fields"><label>开始日期<input id="video-published-from" v-model="videoSearch.publishedFrom" type="date" :max="videoSearch.publishedTo || undefined" @change="refreshVideos" /></label><span>至</span><label>结束日期<input v-model="videoSearch.publishedTo" type="date" :min="videoSearch.publishedFrom || undefined" @change="refreshVideos" /></label></div><div class="date-menu-shortcuts"><button type="button" @click="setVideoDateRange('today')">今天</button><button type="button" @click="setVideoDateRange('yesterday')">昨天</button><button type="button" @click="setVideoDateRange('week')">近一周</button><button type="button" @click="setVideoDateRange('month')">近一月</button></div></div></div><button class="primary-button query-button" @click="refreshVideos">查询</button></div><div class="search-foot"><span>可按作者、标签、视频标题和发布时间搜索</span><div><span>已找到 <b>{{ videoTotal }}</b> 条</span><button class="clear-filters" @click="resetVideoSearch">重置条件</button></div></div></section>
+        <div class="page-heading"><div><div class="eyebrow">CONTENT <span>·</span> 采集结果</div><h1>采集视频</h1><p>查看视频基础信息、互动数据、处理状态和评论内容。</p></div><button class="primary-button" @click="openNewTask"><span>＋</span> 新建采集</button></div>
+        <section class="search-panel video-search-panel"><div class="video-search-main"><div ref="authorPicker" class="author-picker" @keydown.esc.stop="authorDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="authorDropdownOpen" aria-controls="author-options-menu" @click="toggleAuthorDropdown"><span class="author-selection-text">{{ selectedAuthorNames.length ? selectedAuthorNames.join('、') : '选择作者名称（支持多选）' }}</span><span v-if="selectedAuthorNames.length" class="author-selection-count">{{ selectedAuthorNames.length }}</span><span>⌄</span></button><div v-if="authorDropdownOpen" id="author-options-menu" class="author-options-menu"><input v-model="authorSearch" class="author-options-search" aria-label="搜索作者名称" placeholder="搜索作者名称…" /><div class="author-options-toolbar"><span>已选 {{ selectedAuthorNames.length }} 位作者</span><button type="button" @click="selectedAuthorNames = []; refreshVideos()">清空</button></div><div class="author-options-list"><p v-if="authorOptionsLoading">正在加载…</p><p v-else-if="authorOptionsFailed">作者列表加载失败 <button type="button" @click="loadAuthorOptions">重试</button></p><p v-else-if="!authorOptions.length">没有匹配的作者</p><label v-for="option in authorOptionsLoading || authorOptionsFailed ? [] : authorOptions" :key="option.name" :class="{ selected: selectedAuthorNames.includes(option.name) }"><input v-model="selectedAuthorNames" type="checkbox" :value="option.name" @change="refreshVideos" /><span class="dropdown-option-avatar" aria-hidden="true">{{ option.name.slice(0, 1) }}</span><span class="dropdown-option-name">{{ option.name }}</span><small>{{ option.count }} 条视频</small></label></div></div></div><div ref="tagPicker" class="author-picker" @keydown.esc.stop="tagDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="tagDropdownOpen" aria-controls="tag-options-menu" @click="toggleTagDropdown"><span class="author-selection-text">{{ selectedTags.length ? selectedTags.join('、') : '选择视频标签（支持多选）' }}</span><span v-if="selectedTags.length" class="author-selection-count">{{ selectedTags.length }}</span><span>⌄</span></button><div v-if="tagDropdownOpen" id="tag-options-menu" class="author-options-menu"><input v-model="tagSearch" class="author-options-search" aria-label="搜索视频标签" placeholder="搜索视频标签…" /><div class="author-options-toolbar"><span>已选 {{ selectedTags.length }} 个标签</span><button type="button" @click="selectedTags = []; refreshVideos()">清空</button></div><div class="author-options-list"><p v-if="tagOptionsLoading">正在加载…</p><p v-else-if="tagOptionsFailed">标签列表加载失败 <button type="button" @click="loadTagOptions">重试</button></p><p v-else-if="!tagOptions.length">没有匹配的标签</p><label v-for="option in tagOptionsLoading || tagOptionsFailed ? [] : tagOptions" :key="option.name" :class="{ selected: selectedTags.includes(option.name) }"><input v-model="selectedTags" type="checkbox" :value="option.name" @change="refreshVideos" /><span class="dropdown-option-name">#{{ option.name }}</span><small>{{ option.count }} 条</small></label></div></div></div><label class="search-box video-search-box"><span>⌕</span><input v-model="videoSearch.title" placeholder="视频标题或简介关键词" @keyup.enter="refreshVideos" /></label><div ref="datePicker" class="video-date-picker" @keydown.esc.stop="dateDropdownOpen = false"><button type="button" class="author-picker-trigger" :aria-expanded="dateDropdownOpen" aria-controls="video-date-menu" :title="videoDateLabel" @click="dateDropdownOpen = !dateDropdownOpen"><svg viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true"><rect x="3" y="4" width="14" height="13" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M6 2v4m8-4v4M3 9h14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><span class="author-selection-text">{{ videoDateLabel }}</span><span>⌄</span></button><div v-if="dateDropdownOpen" id="video-date-menu" class="video-date-menu"><div class="date-menu-heading"><strong>视频发布时间</strong><button type="button" @click="clearVideoDates">全部时间</button></div><div class="date-menu-fields"><label>开始日期<input id="video-published-from" v-model="videoSearch.publishedFrom" type="date" :max="videoSearch.publishedTo || undefined" @change="refreshVideos" /></label><span>至</span><label>结束日期<input v-model="videoSearch.publishedTo" type="date" :min="videoSearch.publishedFrom || undefined" @change="refreshVideos" /></label></div><div class="date-menu-shortcuts"><button type="button" @click="setVideoDateRange('today')">今天</button><button type="button" @click="setVideoDateRange('yesterday')">昨天</button><button type="button" @click="setVideoDateRange('week')">近一周</button><button type="button" @click="setVideoDateRange('month')">近一月</button></div></div></div><button class="primary-button query-button" @click="refreshVideos">查询</button></div><div class="search-foot"><span>可按作者、标签、视频标题和发布时间搜索 · {{ videoDateLabel }}</span><div><span v-if="videosLoading">查询中…</span><span v-else>已找到 <b>{{ videoTotal }}</b> 条</span><button class="clear-filters" @click="resetVideoSearch">重置条件</button></div></div></section>
         <div class="batch-toolbar video-batch-toolbar"><label class="batch-select-all"><input type="checkbox" :disabled="batchBusy || !videos.length" :checked="!!videos.length && selectedVideoIds.length === videos.length" :indeterminate="selectedVideoIds.length > 0 && selectedVideoIds.length < videos.length" @change="toggleAllVideos(videos, ($event.target as HTMLInputElement).checked)" />全选视频</label><span>已选 {{ selectedVideoIds.length }} 条</span><select v-model="batchVideoAction" :disabled="batchBusy" aria-label="视频批量操作"><option value="refresh">批量更新</option><option value="download">批量下载</option><option value="comments">批量抓取评论</option><option value="transcribe">批量转写</option><option value="report">批量生成报告</option><option value="delete">批量删除</option></select><button :disabled="batchBusy || !selectedVideoIds.length" :class="{ danger: batchVideoAction === 'delete' }" @click="requestBatch('videos')">{{ batchBusy ? '提交中…' : '执行' }}</button><button class="batch-clear" :disabled="batchBusy || !selectedVideoIds.length" @click="selectedVideoIds = []">取消选择</button></div><div class="author-groups-heading"><h2>按作者归类</h2><span>{{ authorVideoGroups.length }} 位作者 · {{ videoTotal }} 条视频</span></div>
-        <div v-if="!videos.length" class="task-panel empty-state">暂无符合条件的视频数据</div>
-        <details v-for="group in authorVideoGroups" :key="group.key" class="task-panel video-list-panel author-video-group" open><summary class="author-group-summary"><div class="author-group-avatar">{{ group.name.slice(0, 1) }}</div><div class="author-group-info"><h2>{{ group.name }}</h2><p>{{ group.authorId || '暂无作者 ID' }}</p></div><span class="recent-count">{{ group.videos.length }} 条视频</span><span class="author-group-chevron" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none"><path d="m6 8 4 4 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg></span></summary><div class="task-table-wrap"><table class="task-table video-table"><thead><tr><th class="selection-cell"><input type="checkbox" :disabled="batchBusy" :checked="group.videos.every((video) => selectedVideoIds.includes(videoKey(video)))" :indeterminate="group.videos.some((video) => selectedVideoIds.includes(videoKey(video))) && !group.videos.every((video) => selectedVideoIds.includes(videoKey(video)))" :aria-label="`全选 ${group.name} 的视频`" @change="toggleAllVideos(group.videos, ($event.target as HTMLInputElement).checked)" /></th><th>视频</th><th>标签</th><th>发布时间</th><th>点赞</th><th>收藏</th><th>转发</th><th>处理状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="video in group.videos" :key="`${video.platform}-${video.video_id}`" :class="{ 'batch-selected': selectedVideoIds.includes(videoKey(video)) }"><td class="selection-cell"><input v-model="selectedVideoIds" type="checkbox" :value="videoKey(video)" :disabled="batchBusy" :aria-label="`选择视频 ${video.title}`" /></td><td><div class="collected-video clickable-video" role="button" tabindex="0" @click="openVideoDetail(video)" @keydown.enter="openVideoDetail(video)"><div class="video-cover"><img v-if="video.cover_url" :src="video.cover_url" alt="" /><span v-else>{{ video.content_type === 'image' ? '▧' : '▶' }}</span></div><div><strong>{{ video.title || '标题未读取' }}</strong><small>{{ video.description || video.video_id }}</small></div></div></td><td class="video-tags-cell"><div v-if="video.hashtags.length" class="video-list-tags"><span v-for="tag in video.hashtags" :key="tag">#{{ tag }}</span></div><span v-else class="detail-muted">暂无标签</span></td><td class="time-cell">{{ formatDateTime(video.published_at) }}</td><td class="metric-cell">{{ formatCount(video.likes) }}</td><td class="metric-cell">{{ formatCount(video.favorites) }}</td><td class="metric-cell">{{ formatCount(video.shares) }}</td><td><div class="video-process-grid"><button v-for="action in videoActions" :key="action.key" class="video-process-button" :class="{ complete: videoActionDone(video, action.key), busy: videoActionBusy(video, action.key) }" :disabled="(videoActionDone(video, action.key) && action.key !== 'report') || Boolean(video.running_actions?.length) || submittingVideoActions.some((key) => key.startsWith(video.video_id + ':')) || (action.key === 'transcribe' && video.content_type === 'image')" :title="action.key === 'report' && video.report_complete ? '打开所在目录并选中报告文件' : action.key === 'transcribe' && video.content_type === 'image' ? '图文作品不支持语音转写' : videoActionDone(video, action.key) ? action.done : '点击执行：' + action.pending" @click.stop="startVideoAction(video, action.key)"><span>{{ videoActionBusy(video, action.key) ? '…' : videoActionDone(video, action.key) ? '✓' : action.icon }}</span>{{ videoActionBusy(video, action.key) ? action.label + '中' : action.key === 'transcribe' && video.content_type === 'image' ? '不适用' : action.label }}</button></div></td><td class="time-cell">{{ formatDateTime(video.updated_at) }}</td><td><div class="video-row-actions"><button class="video-refresh-button" title="更新点赞、收藏、转发和评论" :disabled="Boolean(video.running_actions?.length) || submittingVideoActions.some((key) => key.startsWith(video.video_id + ':'))" @click.stop="startVideoAction(video, 'refresh')"><span aria-hidden="true">⟳</span><small>{{ videoActionBusy(video, 'refresh') ? '更新中…' : '更新' }}</small></button><button class="video-delete-button" :aria-label="`删除视频记录 ${video.title || video.video_id}`" @click.stop="deleteVideoTarget = video"><span aria-hidden="true">⌫</span><small>删除</small></button></div></td></tr></tbody></table></div></details>
+        <div v-if="videoLoadError" class="task-panel empty-state">视频读取失败：{{ videoLoadError }} <button class="text-link" @click="refreshVideos">重新加载</button></div><div v-else-if="!videos.length" class="task-panel empty-state"><template v-if="videosLoading">正在查询视频…</template><template v-else><p>暂无符合当前筛选条件的视频数据</p><p v-if="videoSearch.publishedFrom || videoSearch.publishedTo">当前按发布时间筛选：{{ videoDateLabel }}，较早发布的视频不会显示。</p><div class="empty-filter-actions"><button v-if="videoSearch.publishedFrom || videoSearch.publishedTo" class="secondary-button" @click="clearVideoDates">查看全部发布时间</button><button v-if="videoSourceUrl" class="secondary-button" @click="clearVideoSource">移除来源限制</button><button class="secondary-button" @click="resetVideoSearch">重置条件</button></div></template></div>
+        <details v-for="group in authorVideoGroups" :key="group.key" class="task-panel video-list-panel author-video-group" open><summary class="author-group-summary"><div class="author-group-avatar">{{ group.name.slice(0, 1) }}</div><div class="author-group-info"><h2>{{ group.name }}</h2><p>{{ group.authorId || '暂无作者 ID' }}</p></div><span class="recent-count">{{ group.videos.length }} 条视频</span><span class="author-group-chevron" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none"><path d="m6 8 4 4 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg></span></summary><div class="task-table-wrap"><table class="task-table video-table"><thead><tr><th class="selection-cell"><input type="checkbox" :disabled="batchBusy" :checked="group.videos.every((video) => selectedVideoIds.includes(videoKey(video)))" :indeterminate="group.videos.some((video) => selectedVideoIds.includes(videoKey(video))) && !group.videos.every((video) => selectedVideoIds.includes(videoKey(video)))" :aria-label="`全选 ${group.name} 的视频`" @change="toggleAllVideos(group.videos, ($event.target as HTMLInputElement).checked)" /></th><th>视频</th><th>标签</th><th>发布时间</th><th>点赞</th><th>收藏</th><th>转发</th><th>处理状态</th><th>操作</th></tr></thead><tbody><tr v-for="video in group.videos" :key="`${video.platform}-${video.video_id}`" :class="{ 'batch-selected': selectedVideoIds.includes(videoKey(video)) }"><td class="selection-cell"><input v-model="selectedVideoIds" type="checkbox" :value="videoKey(video)" :disabled="batchBusy" :aria-label="`选择视频 ${video.title}`" /></td><td><div class="collected-video clickable-video" role="button" tabindex="0" @click="openVideoDetail(video)" @keydown.enter="openVideoDetail(video)"><div class="video-cover"><img v-if="video.cover_url" :src="video.cover_url" alt="" /><span v-else>{{ video.content_type === 'image' ? '▧' : '▶' }}</span></div><div><strong>{{ video.title || '标题未读取' }}</strong><small>{{ video.description || video.video_id }}</small></div></div></td><td class="video-tags-cell"><div v-if="video.hashtags.length" class="video-list-tags"><span v-for="tag in video.hashtags" :key="tag">#{{ tag }}</span></div><span v-else class="detail-muted">暂无标签</span></td><td class="time-cell">{{ formatDateTime(video.published_at) }}</td><td class="metric-cell">{{ formatCount(video.likes) }}</td><td class="metric-cell">{{ formatCount(video.favorites) }}</td><td class="metric-cell">{{ formatCount(video.shares) }}</td><td><div class="video-process-grid"><button v-for="action in videoActions" :key="action.key" class="video-process-button" :class="{ complete: videoActionDone(video, action.key), busy: videoActionBusy(video, action.key) }" :disabled="(videoActionDone(video, action.key) && action.key !== 'report') || Boolean(video.running_actions?.length) || submittingVideoActions.some((key) => key.startsWith(video.video_id + ':')) || (action.key === 'transcribe' && video.content_type === 'image')" :title="action.key === 'report' && video.report_complete ? '打开所在目录并选中报告文件' : action.key === 'transcribe' && video.content_type === 'image' ? '图文作品不支持语音转写' : videoActionDone(video, action.key) ? action.done : '点击执行：' + action.pending" @click.stop="startVideoAction(video, action.key)"><span>{{ videoActionBusy(video, action.key) ? '…' : videoActionDone(video, action.key) ? '✓' : action.icon }}</span>{{ videoActionBusy(video, action.key) ? action.label + '中' : action.key === 'transcribe' && video.content_type === 'image' ? '不适用' : action.label }}</button></div></td><td><div class="video-row-actions"><button class="video-refresh-button" title="更新点赞、收藏、转发和评论" :disabled="Boolean(video.running_actions?.length) || submittingVideoActions.some((key) => key.startsWith(video.video_id + ':'))" @click.stop="startVideoAction(video, 'refresh')"><span aria-hidden="true">⟳</span><small>{{ videoActionBusy(video, 'refresh') ? '更新中…' : '更新' }}</small></button><button class="video-delete-button" :aria-label="`删除视频记录 ${video.title || video.video_id}`" @click.stop="deleteVideoTarget = video"><span aria-hidden="true">⌫</span><small>删除</small></button></div></td></tr></tbody></table></div></details>
         <section v-if="selectedVideo" class="modal-backdrop" @click.self="selectedVideo = null" @keydown.esc="selectedVideo = null">
           <div class="create-panel video-detail-panel" role="dialog" aria-modal="true" aria-labelledby="video-detail-title">
             <div class="panel-heading"><div><span class="eyebrow">VIDEO DETAIL</span><h2 id="video-detail-title">{{ selectedVideo.title || '视频详情' }}</h2></div><button class="close-button" aria-label="关闭" @click="selectedVideo = null">×</button></div>
@@ -717,4 +834,5 @@ watch(page, (value) => localStorage.setItem('douyin-current-page', value))
     <div v-if="batchResult" class="modal-backdrop confirm-backdrop" @click.self="batchResult = null"><section class="confirm-dialog batch-result-dialog" role="dialog" aria-modal="true" aria-labelledby="batch-result-title"><h2 id="batch-result-title">批量操作结果</h2><p>{{ batchResult.summary }}</p><p>已提交的流程将在后台逐项执行，具体进度和错误可在任务列表查看。</p><ul v-if="batchResult.details.length"><li v-for="(detail, index) in batchResult.details" :key="index">{{ detail }}</li></ul><button class="secondary-button" @click="batchResult = null">关闭</button></section></div>
     <Transition name="toast"><div v-if="toast" class="toast-message"><span>✓</span>{{ toast }}</div></Transition>
   </div>
+
 </template>

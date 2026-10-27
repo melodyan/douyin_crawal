@@ -587,6 +587,46 @@ class DouyinAdapter:
             video.metadata_error = "登录弹层遮挡作品页；请在可见浏览器中登录后重试"
         return video
 
+    def _scan_reply_list(self, reset: bool = False) -> bool:
+        """Revisit virtualized comments; report actual movement to bound idle retries."""
+        try:
+            return self.page.locator('[data-e2e="comment-item"]').evaluate_all("""(items, reset) => {
+                const item = items.find(e => e.getClientRects().length);
+                let owner = item?.parentElement;
+                while (owner && !(owner.scrollHeight > owner.clientHeight &&
+                    /auto|scroll/.test(getComputedStyle(owner).overflowY))) owner = owner.parentElement;
+                owner ||= document.querySelector('.route-scroll-container');
+                if (!owner) return false;
+                const before = owner.scrollTop;
+                owner.scrollTop = reset ? 0 : before + Math.max(200, owner.clientHeight * 0.7);
+                return owner.scrollTop !== before;
+            }""", reset) is True
+        except Exception:
+            return False
+
+    def _expand_comment_replies(self, roots: list[Comment]) -> bool:
+        """Click rendered reply controls, including span/div text actions."""
+        pattern = re.compile(r"^(?:展开|查看|显示|加载|更多)\s*(?:更多|全部|剩余)?\s*[\d,.万]*\s*(?:条|个)?\s*(?:回复)?\s*[›∨⌄>↓]?$")
+        for comment in roots:
+            lines = comment.text.strip().splitlines()
+            if not lines:
+                continue
+            try:
+                scope = self.page.locator('[data-e2e="comment-item"]').filter(has_text=lines[0][:48])
+                candidates = scope.locator('.replyContainer button, button.comment-reply-expand-btn').filter(has_text=pattern).all()
+                candidates += scope.get_by_text(pattern).all()
+                for button in candidates:
+                    try:
+                        if button.is_visible():
+                            button.scroll_into_view_if_needed(timeout=1500)
+                            button.click(timeout=1500)
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return False
+
     def read_comments(self, video: Video, limit: int | None,
                       on_progress: Callable[[CommentResult], None] | None = None,
                       existing: list[Comment] | None = None) -> CommentResult:
@@ -611,6 +651,8 @@ class DouyinAdapter:
         previous_count = -1
         parse_error = False
         top_complete = False
+        reply_scan_started = False
+        reply_scan_steps = 0
         stop = "连续滚动无新评论，未确认到底"
         while True:
             new_responses = self.responses[response_index:]
@@ -684,36 +726,24 @@ class DouyinAdapter:
                 stop = f"达到评论上限 {limit}，已采集所选一级评论的回复"
                 break
             reply_button_found = False
-            if (missing or pending_reply_pages) and (top_complete or limit_reached):
-                try:
-                    pattern = re.compile(r"(?:展开|查看|更多).*回复|^展开更多$")
-                    reply_selector = '.replyContainer button, button.comment-reply-expand-btn'
-                    buttons = []
-                    for cid in root_ids[:limit] if limit is not None else root_ids:
-                        if (expected_replies.get(cid, 0) <= reply_counts.get(cid, 0)
-                                and not reply_more.get(cid)):
-                            continue
-                        snippet = comments[cid].text.strip().splitlines()[0][:24]
-                        if snippet:
-                            buttons.extend(self.page.locator('[data-e2e="comment-item"]')
-                                           .filter(has_text=snippet).locator(reply_selector)
-                                           .filter(has_text=pattern).all())
-                        if buttons:
-                            break
-                    for button in buttons:
-                        try:
-                            if button.is_visible():
-                                reply_button_found = True
-                                button.click(timeout=1500)
-                                break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
+            if missing or pending_reply_pages:
+                reply_button_found = self._expand_comment_replies([
+                    comments[cid] for cid in root_ids if cid in selected_roots
+                    and (expected_replies.get(cid, 0) > reply_counts.get(cid, 0) or reply_more.get(cid))])
             if top_complete and not missing and not pending_reply_pages and not parse_error:
                 stop = "一级评论与回复均确认到底"
                 break
+            # The last root page can leave older reply controls outside the virtual
+            # DOM. Make one bounded pass from the top instead of idling at the end.
+            scanning_replies = False
+            if (missing or pending_reply_pages) and not reply_button_found and (top_complete or limit_reached):
+                if reply_scan_steps < 100:
+                    scanning_replies = self._scan_reply_list(reset=not reply_scan_started)
+                    reply_scan_started = True
+                    reply_scan_steps += 1
             no_new = no_new + 1 if len(comments) == previous_count and not page_seen else 0
+            if scanning_replies:
+                no_new = 0
             previous_count = len(comments)
             if no_new >= self.crawl["no_new_content_scrolls"]:
                 if missing or pending_reply_pages:
@@ -721,7 +751,7 @@ class DouyinAdapter:
                     if not reply_button_found and (top_complete or limit_reached):
                         stop += "；页面未找到可展开的回复入口"
                 break
-            if not limit_reached and not top_complete:
+            if not reply_button_found and not limit_reached and not top_complete:
                 self._scroll_comment_list()
             self.page.wait_for_timeout(max(700, int(self.crawl["delay_seconds"] * 1000)))
         if parse_error:

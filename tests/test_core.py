@@ -122,6 +122,29 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(content.count(". 一级评论 · 赞 "), 50)
             store.close()
 
+    def test_reply_text_controls_skip_hidden_roots_and_scroll_into_view(self):
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter.page = Mock()
+        hidden = Mock()
+        hidden.is_visible.return_value = False
+        text_control = Mock()
+        text_control.is_visible.return_value = True
+        first_scope, second_scope = Mock(), Mock()
+        first_scope.locator.return_value.filter.return_value.all.return_value = [hidden]
+        first_scope.get_by_text.return_value.all.return_value = []
+        second_scope.locator.return_value.filter.return_value.all.return_value = []
+        second_scope.get_by_text.return_value.all.return_value = [text_control]
+        adapter.page.locator.return_value.filter.side_effect = [first_scope, second_scope]
+        self.assertTrue(adapter._expand_comment_replies([Comment("1", "第一条"), Comment("2", "第二条")]))
+        hidden.click.assert_not_called()
+        text_control.scroll_into_view_if_needed.assert_called_once()
+        text_control.click.assert_called_once()
+        pattern = second_scope.get_by_text.call_args.args[0]
+        for label in ("展开 23 条回复", "查看更多回复", "展开更多", "查看全部12条回复"):
+            self.assertIsNotNone(pattern.search(label), label)
+        self.assertIsNone(pattern.search("收起回复"))
+        self.assertIsNone(pattern.search("这里是展开回复的评论正文"))
+
     def test_comment_parser_and_merge(self):
         payload = {"comments": [{"cid": "1", "text": "一级", "reply_comment_total": 2, "reply_id": "0"},
                                 {"cid": "2", "text": "回复", "reply_id": "1"}]}
@@ -179,6 +202,7 @@ class CoreTests(unittest.TestCase):
         button.is_visible.return_value = True
         button.click.side_effect = lambda **_: adapter.responses.append((reply_url, replies.pop(0)))
         comment_items = Mock()
+        comment_items.filter.return_value.get_by_text.return_value.all.return_value = []
         comment_items.filter.return_value.locator.return_value.filter.return_value.all.return_value = [button]
         hidden = Mock()
         hidden.first.is_visible.return_value = False
@@ -196,6 +220,39 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(all(not call.args[0].complete for call in progress.call_args_list))
         pattern = comment_items.filter.return_value.locator.return_value.filter.call_args.kwargs["has_text"]
         self.assertIsNotNone(pattern.search("展开更多"))
+
+    def test_missing_reply_controls_are_revisited_after_root_list_ends(self):
+        adapter = DouyinAdapter.__new__(DouyinAdapter)
+        adapter.page = Mock(url="https://www.douyin.com/video/123")
+        adapter.crawl = {"no_new_content_scrolls": 1, "delay_seconds": 0}
+        adapter._login_overlay_visible = Mock(return_value=False)
+        adapter._expand_comment_replies = Mock(return_value=False)
+        main_url = "https://www.douyin.com/aweme/v1/web/comment/list/?aweme_id=123"
+        reply_url = "https://www.douyin.com/aweme/v1/web/comment/list/reply/?comment_id=1&aweme_id=123"
+        main = {"status_code": 0, "has_more": 0, "comments": [
+            {"cid": "1", "text": "一级", "reply_comment_total": 1}]}
+        adapter.responses = [(main_url, main)]
+
+        def scan(reset=False):
+            if reset:
+                return True
+            adapter.responses.append((reply_url, {"status_code": 0, "has_more": 0,
+                "comments": [{"cid": "2", "text": "回复", "reply_id": "1"}]}))
+            return True
+
+        adapter._scan_reply_list = Mock(side_effect=scan)
+        result = adapter.read_comments(Video("douyin", "123", adapter.page.url), None)
+        self.assertTrue(result.complete)
+        self.assertEqual(len(result.comments), 2)
+        self.assertEqual(adapter._scan_reply_list.call_count, 2)
+        self.assertTrue(adapter._scan_reply_list.call_args_list[0].kwargs["reset"])
+
+        # No movement and no reply response must still terminate as incomplete.
+        adapter.responses = [(main_url, main)]
+        adapter._scan_reply_list = Mock(return_value=False)
+        result = adapter.read_comments(Video("douyin", "123", adapter.page.url), None)
+        self.assertFalse(result.complete)
+        self.assertIn("1 条回复未采集", result.stop_reason)
 
     def test_report_is_one_file_per_video_with_all_replies_by_default(self):
         with tempfile.TemporaryDirectory() as directory:

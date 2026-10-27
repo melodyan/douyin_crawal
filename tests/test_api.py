@@ -26,6 +26,68 @@ class ApiTests(unittest.TestCase):
         (root / "config.yaml.bak").write_text(DEFAULT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
         return root
 
+    def test_display_date_uses_shanghai_day(self):
+        self.assertEqual(api._display_date('2026-10-27T20:04:23+00:00'), '2026-10-28')
+        self.assertEqual(api._display_date('2026-10-27T12:04:23+00:00'), '2026-10-27')
+        self.assertEqual(api._display_date('2026-10-28T01:00:00+08:00'), '2026-10-28')
+        self.assertEqual(api._display_date(''), '')
+
+    def test_pause_edit_resume_preserves_identity_and_saved_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, "ROOT", root), patch.object(api.threading, "Thread"):
+                client = TestClient(api.app)
+                original = client.post('/api/tasks', json={
+                    'mode': 'collect', 'urls': ['https://www.douyin.com/video/123'],
+                    'options': {'title': '原任务'},
+                }).json()['data']
+                task_id = original['id']
+                path = f'/api/tasks/{task_id}'
+                self.assertEqual(client.put(path, json={'mode': 'collect'}).status_code, 409)
+                self.assertEqual(client.post(path + '/pause').status_code, 200)
+                self.assertTrue(api.CANCEL_EVENTS[task_id].is_set())
+                self.assertEqual(client.post(path + '/resume').status_code, 409)
+                # Simulate a worker saving stale running/completed data after the pause request.
+                original.update(state='done', progress=70)
+                api._save_task(original)
+                self.assertEqual(api._get_task(task_id)['state'], 'paused')
+                api.CANCEL_EVENTS.clear()
+                self.assertEqual(client.get('/api/tasks').json()['data']['items'][0]['state'], 'paused')
+                edited = client.put(path, json={'mode': 'collect',
+                    'urls': ['https://www.douyin.com/video/456'],
+                    'options': {'title': '修改后的任务', 'include_comments': True, 'max_comments_per_video': 25, 'max_videos_per_collection': None}})
+                self.assertEqual(edited.status_code, 200, edited.text)
+                task = edited.json()['data']
+                self.assertEqual(task['title'], '修改后的任务')
+                saved = client.get(path).json()['data']
+                self.assertEqual(saved['options']['max_comments_per_video'], 25)
+                self.assertIsNone(saved['options']['max_videos_per_collection'])
+                self.assertEqual(task['created_at'], original['created_at'])
+                self.assertEqual(task['progress'], 70)
+                resumed = client.post(path + '/resume')
+                self.assertEqual(resumed.status_code, 202, resumed.text)
+                task = resumed.json()['data']
+                self.assertEqual(task['id'], task_id)
+                self.assertEqual(task['urls'], ['https://www.douyin.com/video/456'])
+                self.assertFalse(task['options']['force_reprocess'])
+                self.assertEqual(task['options']['max_comments_per_video'], 25)
+                self.assertEqual(client.post(path + '/resume').status_code, 409)
+
+    def test_paused_queued_task_does_not_collect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            with patch.object(api, 'ROOT', root), patch.object(api.threading, 'Thread'):
+                client = TestClient(api.app)
+                task = client.post('/api/tasks', json={'mode': 'collect', 'urls': ['https://www.douyin.com/video/123']}).json()['data']
+                task_id = task['id']
+                client.post(f'/api/tasks/{task_id}/pause')
+                request = api.TaskRequest(mode=task['mode'], urls=task['urls'], options=task['options'])
+                with patch.object(api, 'collect_or_run') as collect:
+                    api._run_task(task_id, request, api._config())
+                    collect.assert_not_called()
+                self.assertEqual(api._get_task(task_id)['state'], 'paused')
+                self.assertNotIn(task_id, api.CANCEL_EVENTS)
+
     def test_queued_tasks_do_not_execute_together(self):
         started = threading.Event()
         release = threading.Event()

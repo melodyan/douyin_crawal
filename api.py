@@ -8,7 +8,7 @@ import tempfile
 import threading
 import uuid
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import yaml
@@ -61,6 +61,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _display_date(value: str) -> str:
+    if not value:
+        return ''
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            return value[:10]
+        return parsed.astimezone(timezone(timedelta(hours=8))).date().isoformat()
+    except ValueError:
+        return ''
+
+
 def _config_path() -> Path:
     return default_config_path(ROOT)
 
@@ -78,6 +90,15 @@ def _save_task(task: dict, config: dict | None = None):
     with TASK_LOCK:
         store = _store(config)
         try:
+            event = CANCEL_EVENTS.get(task['id'])
+            previous = store.get_task(task['id']) if event and event.is_set() else None
+            if previous and previous['state'] in {'paused', 'cancelled'}:
+                task['state'] = previous['state']
+                task['error'] = ('任务已暂停；已完成的步骤已保存' if task['state'] == 'paused'
+                                 else '任务已取消；已完成的步骤已保存')
+                for step, state in task['steps'].items():
+                    if state == 'running':
+                        task['steps'][step] = 'pending' if task['state'] == 'paused' else 'cancelled'
             store.save_task(task)
         finally:
             store.close()
@@ -96,7 +117,7 @@ def _get_task(task_id: str, config: dict | None = None) -> dict:
 
 def _task_options(config: dict, options: dict):
     config["crawl"]["refresh_completed"] = bool(
-        options.get("force_reprocess", options.get("refresh_completed", False)))
+        options.get("force_reprocess", options.get("refresh_completed", config["crawl"]["refresh_completed"])))
     for key, section in (("max_comments_per_video", "crawl"),
                          ("max_videos_per_profile", "inputs"),
                          ("max_videos_per_collection", "inputs")):
@@ -144,6 +165,8 @@ def _run_task(task_id: str, request: TaskRequest, config: dict):
         _save_task(current, config)
 
     try:
+        if event.is_set():
+            raise TaskCancelled("任务已停止")
         _task_options(config, request.options)
         if request.options.get("video_action"):
             action = request.options["video_action"]
@@ -227,8 +250,15 @@ def _run_task(task_id: str, request: TaskRequest, config: dict):
 
 def _run_queued_task(task_id: str, request: TaskRequest, config: dict):
     # Browser tasks share one persistent profile and must not launch together.
-    with EXECUTION_LOCK:
+    event = CANCEL_EVENTS.get(task_id)
+    while not EXECUTION_LOCK.acquire(timeout=0.1):
+        if event and event.is_set():
+            CANCEL_EVENTS.pop(task_id, None)
+            return
+    try:
         _run_task(task_id, request, config)
+    finally:
+        EXECUTION_LOCK.release()
 
 
 def _create_task(request: TaskRequest, existing: dict | None = None) -> dict:
@@ -385,6 +415,82 @@ def cancel_task(task_id: str):
     return {"data": task}
 
 
+@app.post("/api/tasks/{task_id}/pause")
+def pause_task(task_id: str):
+    with RETRY_LOCK:
+        task = _get_task(task_id)
+        if task['state'] not in {'running', 'pending'}:
+            raise HTTPException(409, "只有等待中或运行中的任务可以暂停")
+        # Save the requested state before signalling the worker so its final save preserves it.
+        task.update(state='paused', error='正在暂停；当前步骤结束后停止')
+        with TASK_LOCK:
+            store = _store()
+            try:
+                store.save_task(task)
+                event = CANCEL_EVENTS.get(task_id)
+                if event:
+                    event.set()
+            finally:
+                store.close()
+        return {"data": task}
+
+
+@app.post("/api/tasks/{task_id}/resume", status_code=202)
+def resume_task(task_id: str):
+    with RETRY_LOCK:
+        old = _get_task(task_id)
+        if task_id in CANCEL_EVENTS:
+            raise HTTPException(409, "任务正在停止，请稍后继续")
+        if old['state'] != 'paused':
+            raise HTTPException(409, "只有已暂停的任务可以继续")
+        options = dict(old.get('options', {}))
+        options.update(force_reprocess=False, refresh_completed=False)
+        try:
+            return {"data": _create_task(TaskRequest(mode=old['mode'], urls=old.get('urls', []), options=options), existing=old)}
+        except (OSError, TypeError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/tasks/{task_id}")
+def edit_task(task_id: str, request: TaskRequest):
+    with RETRY_LOCK:
+        task = _get_task(task_id)
+        if task_id in CANCEL_EVENTS or task['state'] in {'pending', 'running'}:
+            raise HTTPException(409, "请先暂停任务，待当前步骤结束后再修改")
+        options = dict(request.options)
+        title = str(options.get('title', '')).strip()
+        if not title or len(title) > 80:
+            raise HTTPException(422, "任务名称需为 1 至 80 个字符")
+        if options.get('video_action') or task.get('options', {}).get('video_action'):
+            raise HTTPException(422, "视频单项操作任务不支持修改，请从视频列表重新发起操作")
+        if not any(options.get(key) for key in ['download_video', 'transcribe_text', 'include_comments', 'generate_report']):
+            raise HTTPException(422, "至少选择一个处理模块")
+        if options.get('transcribe_text') and not options.get('local_video_path') and not options.get('download_video'):
+            raise HTTPException(422, "转写需要同时选择下载视频")
+        config = _config()
+        try:
+            _task_options(config, options)
+            local_path = options.get('local_video_path')
+            if local_path:
+                if not Path(str(local_path)).is_absolute() or not Path(str(local_path)).is_file():
+                    raise ValueError("本地视频路径必须是存在的绝对路径")
+                if not options.get('transcribe_text') or any(options.get(key) for key in ['download_video', 'include_comments', 'generate_report']):
+                    raise ValueError("本地视频仅支持单独转写文字")
+                validate(config, 'transcribe', [])
+            else:
+                if not request.urls:
+                    raise ValueError("请填写来源链接")
+                config['inputs']['urls'] = request.urls
+                config['inputs']['urls_file'] = None
+                request.urls = input_urls(config)
+                validate(config, request.mode, request.urls)
+        except (OSError, TypeError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        task.update(title=title, mode=request.mode, urls=request.urls, options=options)
+        _save_task(task)
+        return {"data": task}
+
+
 @app.post("/api/tasks/{task_id}/retry", status_code=202)
 def retry_task(task_id: str):
     with RETRY_LOCK:
@@ -500,9 +606,9 @@ def list_videos(limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=
             all_items = [item for item in all_items
                          if title_query in item.title.casefold() or title_query in item.description.casefold()]
         if published_from:
-            all_items = [item for item in all_items if item.published_at and item.published_at[:10] >= published_from]
+            all_items = [item for item in all_items if item.published_at and _display_date(item.published_at) >= published_from]
         if published_to:
-            all_items = [item for item in all_items if item.published_at and item.published_at[:10] <= published_to]
+            all_items = [item for item in all_items if item.published_at and _display_date(item.published_at) <= published_to]
         source = source_url.strip()
         if source:
             source_ids: set[str] = set()
